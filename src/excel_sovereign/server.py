@@ -382,7 +382,7 @@ def apply_workbook(path: str, ops: list[dict], tool: str = "workbook_apply") -> 
             except KeyError as exc:
                 return _error("invalid_ops", str(exc).strip("'\""), path=path), []
             if not ops:
-                return _nothing_to_do(path, "sheet already ends at its last non-empty cell"), []
+                return _nothing_to_do(path, "nothing lies past the data and the ranges formulas, names, or rules still reference"), []
         info = inspect_workbook(path)
         if ops and ops[0]["action"] == "verify" and len(ops) == 1:
             decision = RouteDecision("com", True, False, "verify")
