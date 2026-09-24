@@ -70,7 +70,7 @@ flowchart TD
   shot --> back[返回 committed、verified 和图片]
 ```
 
-各入口使用同一份 `ops` 形状。一批里只要有一步需要 Excel，整批都走 COM。表、查询、数据模型和 VBA 分开发送，避免每次对话带上全部参数。
+各入口使用同一份 `ops` 形状。一批里只要有一步需要 Excel，整批都走 COM。表、查询、数据模型和 VBA 分开发送，避免每次对话带上全部参数。这四个入口也可以带上单元格、排版和工作表结构，填数据和建表仍是一次调用。
 
 ```mermaid
 sequenceDiagram
@@ -97,16 +97,34 @@ sequenceDiagram
 
 | 工具 | 作用 |
 |---|---|
-| `workbook_read` | 读值、公式和缓存。`mode` 取 `overview`（各页范围、计数、残留格式 `extent`）、`sparse`（默认，只返回非空格）、`dense`（写回形状）或 `find`（跨页搜值和公式）。每页最多 4000 格，用 `nextRange` 继续。拿同一把锁，不截图。Excel 里开着的文件读最后保存版。 |
-| `workbook_apply` | 值、公式、名称、排版、`layout`、工作表结构。服务端保存并截图。 |
-| `excel_table` | 表、透视表、图表、切片器。 |
-| `excel_model` | Power Query、数据模型、DAX。 |
+| `workbook_read` | 读值、公式和缓存。`mode` 取 `overview`、`sparse`（默认）、`dense` 或 `find`。每页最多 4000 格，用 `nextRange` 继续。拿同一把锁，不截图。Excel 里开着的文件读最后保存版，并标 `openInExcel: true`。 |
+| `workbook_apply` | 值、公式、名称、排版、`layout`、工作表结构、`trim_sheet`。服务端保存并截图。 |
+| `excel_table` | 表、透视表、图表、切片器。可同时带上值、公式、排版和结构动作。 |
+| `excel_model` | Power Query、数据模型、DAX。同样可以带上单元格和结构动作。 |
 | `excel_view` | 条件格式、数据验证、批注、超链接、冻结、隐藏工作表。 |
-| `excel_vba` | 列出、查看、导入、更新、运行、删除 VBA。只有这一次调用放开宏。 |
+| `excel_vba` | 列出、查看、导入、更新、运行、删除 VBA。只有这一次调用放开宏。Excel 需要信任对 VBA 工程对象模型的访问。 |
 
-动作名写在对应工具的说明里。每个 op 只带自己用到的字段，不把全部命令参数放进工具 schema。送错入口会返回 `wrong_tool`。
+动作名写在对应工具的说明里。每个 op 只带自己用到的字段，不把全部命令参数放进工具 schema。送错入口会返回 `wrong_tool`，并给出该用的工具名。
+
+读的四种 `mode`：
+
+- `overview`：每张表的实际数据范围、非空格数、公式数、合并区、冻结和隐藏状态。`preview` 附带前几行。数据之外还有残留格式时带 `extent`。
+- `sparse`：只返回非空格，按行分组。普通格是值，公式格是 `{f, v}`。
+- `dense`：按 `set_values` 的二维形状返回。整页没有公式时不带 `formulas`。
+- `find`：在值或公式文本里搜关键字，可限定工作表和区域。
+
+查询动作（`*_list`、`table_read`、`powerquery_view`、`datamodel_evaluate`、`validation_get`、`comment_get`、`vba_view`）把结果放在 `results` 里，按这次 `ops` 的下标对应。整次调用全是查询时不保存、不截图，返回 `readOnly: true`。
+
+`trim_sheet` 删掉最后一个非空格之后的行和列，但留下公式、名称、条件格式或数据验证仍在引用的区域。没有可删的行列时不保存，`note` 说明原因。
 
 单次写入超过 10 万格返回 `too_large`，不截断保存。只接受 `.xlsx` 和 `.xlsm`。`.xls`、`.xlsb`、加密和 IRM 在改动前拒绝。
+
+## 返回
+
+- `committed: true` 表示文件已经保存。不要把同一批插入、删除、重命名再发一次。
+- 已经保存但 `verified: false` 时，只发送 `suggestedNextActions` 里的 `verify`。
+- `calculated: true` 只表示这次已经把重算后的缓存写回文件。只改字体、填充、行高列宽时 `calc` 为 `skipped`。
+- 纯查询的 `committed` 是 false，并带 `readOnly: true`。
 
 ## 和别的 Excel MCP 比
 

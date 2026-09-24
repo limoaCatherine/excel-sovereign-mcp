@@ -1,4 +1,4 @@
-"""Three tools and the write pipeline. Models do not choose an engine or hold a session."""
+"""Six tools and the write pipeline. Models do not choose an engine or hold a session."""
 
 from __future__ import annotations
 
@@ -951,8 +951,9 @@ def workbook_apply(path: str, ops: list[dict[str, Any]]) -> list:
     those tools also accept the cell, format, and sheet actions above, so seed data and build on it in one call.
     English formulas. Excel number formats. Close the file in Excel first. Do not repeat a committed insert.
     layout starts a sheet. profile is finance, analytics, or general. A fact block becomes an Excel table.
-    trim_sheet {sheet}: deletes the rows and columns past the last non-empty cell (leftover formatting).
-    workbook_read mode=overview shows it as extent beyond usedRange.
+    trim_sheet {sheet}: deletes leftover rows and columns past the last non-empty cell, while keeping
+    anything formulas, names, validations, or conditional formats still reference. If nothing is past
+    that, the call does not save and note says why. overview shows leftover formatting as extent.
     """
     return _apply(path, ops, "workbook_apply")
 

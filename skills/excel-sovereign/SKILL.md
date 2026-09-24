@@ -37,7 +37,7 @@ description: 用六个短入口修改本地 xlsx 和 xlsm。服务端选择引�
 
 查询类动作（`*_list`、`table_read`、`powerquery_view`、`datamodel_evaluate`、`validation_get`、`comment_get`、`vba_view`）的结果在返回的 `results` 里，按 `op` 下标对应。整次调用全是查询时不保存、不截图，返回 `readOnly: true`。
 
-`overview` 里出现 `extent` 表示数据之外还有残留格式；用 `{"action":"trim_sheet","sheet":"表名"}` 删掉最后一个非空格之后的行列。
+`overview` 里出现 `extent` 表示数据之外还有残留格式。`{"action":"trim_sheet","sheet":"表名"}` 删掉最后一个非空格之后的行列，但留下公式、名称、条件格式或数据验证仍在引用的区域。没有可删的行列时不保存，`note` 说明原因。
 
 ## 返回
 
