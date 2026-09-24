@@ -31,6 +31,8 @@ class VerifyOutcome:
     omitted: list[dict] = field(default_factory=list)
     spill_unknown: bool = False
     error: str | None = None
+    # Committed ops touched no cells or sheets (e.g. a connection-only query).
+    nothing_to_show: bool = False
 
 
 def _payload(item: dict) -> dict:
@@ -49,12 +51,7 @@ def calculate(session: ComSession) -> None:
     session.call([{"command": "calculation.calculate", "args": {"scope": "Workbook"}}])
 
 
-def spill_address(session: ComSession, sheet: str, cell: str) -> tuple[bool, str | None]:
-    """Returns (supported, address). Address is set only when the cell spills."""
-    results = session.call(
-        [{"command": "range.get-spill", "args": {"sheetName": sheet, "rangeAddress": cell}}]
-    )
-    payload = _payload(results[-1]) if results else {}
+def _spill_of(payload: dict) -> tuple[bool, str | None]:
     supported = bool(payload.get("supported", payload.get("Supported", False)))
     has_spill = bool(payload.get("hasSpill", payload.get("HasSpill", False)))
     address = payload.get("address") or payload.get("Address")
@@ -65,16 +62,28 @@ def spill_address(session: ComSession, sheet: str, cell: str) -> tuple[bool, str
     return True, None
 
 
-def _capture_once(session: ComSession, sheet: str, address: str, quality: str) -> tuple[bytes, str, str]:
+def spill_address(session: ComSession, sheet: str, cell: str) -> tuple[bool, str | None]:
+    """Returns (supported, address). Address is set only when the cell spills."""
+    return spill_addresses(session, [(sheet, cell)])[0]
+
+
+def spill_addresses(session: ComSession, cells: list[tuple[str, str]]) -> list[tuple[bool, str | None]]:
+    """One excelcli run for every probe. Same order as `cells`."""
+    if not cells:
+        return []
     results = session.call(
         [
-            {
-                "command": "screenshot.capture",
-                "args": {"sheetName": sheet, "rangeAddress": address, "quality": quality},
-            }
+            {"command": "range.get-spill", "args": {"sheetName": sheet, "rangeAddress": cell}}
+            for sheet, cell in cells
         ]
     )
-    payload = _payload(results[-1]) if results else {}
+    found = [_spill_of(_payload(item)) for item in results[: len(cells)]]
+    found.extend([(False, None)] * (len(cells) - len(found)))
+    return found
+
+
+def _image_of(item: dict) -> tuple[bytes, str, str]:
+    payload = _payload(item)
     encoded = payload.get("imageBase64") or payload.get("ImageBase64") or ""
     mime = payload.get("mimeType") or payload.get("MimeType") or "image/jpeg"
     message = str(payload.get("message") or payload.get("Message") or "")
@@ -83,8 +92,19 @@ def _capture_once(session: ComSession, sheet: str, address: str, quality: str) -
     return base64.b64decode(encoded), mime, message
 
 
-def capture_range(session: ComSession, sheet: str, address: str) -> Shot:
-    data, mime, message = _capture_once(session, sheet, address, "Medium")
+def _capture_command(sheet: str, address: str, quality: str) -> dict:
+    return {
+        "command": "screenshot.capture",
+        "args": {"sheetName": sheet, "rangeAddress": address, "quality": quality},
+    }
+
+
+def _capture_once(session: ComSession, sheet: str, address: str, quality: str) -> tuple[bytes, str, str]:
+    results = session.call([_capture_command(sheet, address, quality)])
+    return _image_of(results[-1] if results else {})
+
+
+def _shrink(session: ComSession, sheet: str, address: str, data: bytes, mime: str, message: str) -> Shot:
     cropped = "truncat" in message.lower()
     used = address
     if len(data) > IMAGE_BUDGET:
@@ -95,6 +115,24 @@ def capture_range(session: ComSession, sheet: str, address: str) -> Shot:
         data, mime, message = _capture_once(session, sheet, used, "Low")
         cropped = True
     return Shot(sheet=sheet, range=used, cropped=cropped, mime=mime, data=data)
+
+
+def capture_range(session: ComSession, sheet: str, address: str) -> Shot:
+    return capture_ranges(session, [(sheet, address)])[0]
+
+
+def capture_ranges(session: ComSession, targets: list[tuple[str, str]]) -> list[Shot]:
+    """Medium-quality captures in one run. Only oversize images are retaken one by one."""
+    if not targets:
+        return []
+    results = session.call([_capture_command(sheet, address, "Medium") for sheet, address in targets])
+    shots = []
+    for (sheet, address), item in zip(targets, results):
+        data, mime, message = _image_of(item)
+        shots.append(_shrink(session, sheet, address, data, mime, message))
+    if len(shots) != len(targets):
+        raise RuntimeError("screenshot batch returned fewer images than requested")
+    return shots
 
 
 def union_ranges(ranges: list[str]) -> str | None:
@@ -121,13 +159,19 @@ def _object_anchors(session: ComSession) -> dict[str, list[str]]:
             for value in node:
                 walk(value, sheet)
 
-    for command in ("chart.list", "pivottable.list"):
-        try:
-            results = session.call([{"command": command, "args": {}}])
-        except Exception:
-            continue
-        if results:
-            walk(_payload(results[-1]))
+    commands = [{"command": name, "args": {}} for name in ("chart.list", "pivottable.list")]
+    try:
+        batches = [session.call(commands)]
+    except Exception:
+        batches = []
+        for command in commands:
+            try:
+                batches.append(session.call([command]))
+            except Exception:
+                continue
+    for results in batches:
+        for item in results:
+            walk(_payload(item))
     return found
 
 

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import subprocess
 import threading
 import time
+from ctypes import wintypes
 from pathlib import Path
 
 from excel_sovereign.lock import file_is_locked
@@ -17,10 +19,18 @@ DEFAULT_TIMEOUT = int(os.environ.get("EXCEL_MCP_COM_TIMEOUT", "180"))
 
 
 class ExcelCliError(RuntimeError):
-    def __init__(self, message: str, *, results: list[dict] | None = None, pid_known: bool = True):
+    def __init__(
+        self,
+        message: str,
+        *,
+        results: list[dict] | None = None,
+        pid_known: bool = True,
+        index: int | None = None,
+    ):
         super().__init__(message)
         self.results = results or []
         self.pid_known = pid_known
+        self.index = index
 
 
 def excelcli_path() -> Path:
@@ -41,20 +51,45 @@ def excelcli_path() -> Path:
     raise FileNotFoundError("excelcli.exe was not found. Build vendor/mcp-server-excel or set EXCELCLI.")
 
 
+class _ProcessEntry(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", ctypes.c_wchar * 260),
+    ]
+
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+_kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+_kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEntry)]
+_kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEntry)]
+_TH32CS_SNAPPROCESS = 0x00000002
+_INVALID_HANDLE = wintypes.HANDLE(-1).value
+
+
 def excel_pids() -> set[int]:
-    script = "Get-Process excel -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id"
-    completed = subprocess.run(
-        ["powershell", "-NoProfile", "-Command", script],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+    snapshot = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if snapshot in (None, _INVALID_HANDLE):
+        return set()
     pids: set[int] = set()
-    for line in completed.stdout.splitlines():
-        line = line.strip()
-        if line.isdigit():
-            pids.add(int(line))
+    entry = _ProcessEntry()
+    entry.dwSize = ctypes.sizeof(_ProcessEntry)
+    try:
+        ok = _kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.lower() == "excel.exe":
+                pids.add(int(entry.th32ProcessID))
+            ok = _kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        _kernel32.CloseHandle(snapshot)
     return pids
 
 
@@ -202,7 +237,13 @@ class ComSession:
         results = run_batch(wrapped, timeout=self.timeout)
         failure = _failed(results)
         if failure is not None:
-            raise ExcelCliError(_short_error(str(failure.get("error") or failure)), results=results, pid_known=self.pid_known)
+            index = failure.get("index")
+            raise ExcelCliError(
+                _short_error(str(failure.get("error") or failure)),
+                results=results,
+                pid_known=self.pid_known,
+                index=int(index) if isinstance(index, int) else None,
+            )
         return results
 
     def close(self, save: bool) -> None:

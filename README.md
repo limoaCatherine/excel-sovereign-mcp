@@ -97,7 +97,7 @@ sequenceDiagram
 
 | 工具 | 作用 |
 |---|---|
-| `workbook_read` | 读值、公式和缓存。默认 4000 格，用 `nextRange` 继续。拿同一把锁，不截图。 |
+| `workbook_read` | 读值、公式和缓存。`mode` 取 `overview`（各页范围、计数、残留格式 `extent`）、`sparse`（默认，只返回非空格）、`dense`（写回形状）或 `find`（跨页搜值和公式）。每页最多 4000 格，用 `nextRange` 继续。拿同一把锁，不截图。Excel 里开着的文件读最后保存版。 |
 | `workbook_apply` | 值、公式、名称、排版、`layout`、工作表结构。服务端保存并截图。 |
 | `excel_table` | 表、透视表、图表、切片器。 |
 | `excel_model` | Power Query、数据模型、DAX。 |

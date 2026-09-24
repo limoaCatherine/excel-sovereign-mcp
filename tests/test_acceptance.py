@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 import zipfile
@@ -9,12 +10,13 @@ from pathlib import Path
 
 import pytest
 from openpyxl import load_workbook
+from openpyxl.styles import Font
 
 from excel_sovereign.book import file_hash
 from excel_sovereign.excel_cli import ExcelCliError, excelcli_path, run_batch
 from excel_sovereign.inspect import inspect_workbook
 from excel_sovereign.lock import file_is_locked
-from excel_sovereign.server import apply_workbook, workbook_read
+from excel_sovereign.server import apply_workbook, read_workbook
 
 pytestmark = pytest.mark.acceptance
 
@@ -26,8 +28,8 @@ def _require_excel() -> None:
         pytest.skip(str(exc))
 
 
-def _apply(path: Path, ops: list[dict]):
-    body, shots = apply_workbook(str(path), ops, "workbook_apply")
+def _apply(path: Path, ops: list[dict], tool: str = "workbook_apply"):
+    body, shots = apply_workbook(str(path), ops, tool)
     return body, shots
 
 
@@ -132,7 +134,7 @@ def test_read_returns_cached_value_after_input_change(tmp_path: Path):
     assert changed["calc"] == "done"
     assert changed["ok"] is True, changed
     assert _cached(path, "汇总", "B1") == 9
-    page = workbook_read(str(path), sheet="汇总", range="B1")[0]
+    page = read_workbook(str(path), sheet="汇总", range="B1", mode="dense")
     assert page["values"][0][0] == 9
 
 
@@ -235,7 +237,7 @@ def test_read_waits_for_write_lock(tmp_path: Path):
     seen = {}
 
     def read():
-        seen["page"] = workbook_read(str(path), sheet="Sheet1", range="A1")[0]
+        seen["page"] = read_workbook(str(path), sheet="Sheet1", range="A1")
 
     thread = threading.Thread(target=read)
     thread.start()
@@ -275,6 +277,7 @@ def test_filtered_table_insert_commit_matches_file(tmp_path: Path):
                 "args": {"tableName": "Data", "columnName": "n", "criteria": "=1"},
             },
         ],
+        "excel_table",
     )
     assert setup["committed"] is True, setup
     before = file_hash(str(path))
@@ -341,7 +344,7 @@ def test_hyperlink_hide_and_measure(tmp_path: Path):
     _require_excel()
     path = tmp_path / "more.xlsx"
     _create(path)
-    body, _ = _apply(
+    table, _ = _apply(
         path,
         [
             {"action": "set_values", "sheet": "Sheet1", "range": "A1", "values": [["n", "v"], [1, 2], [3, 4]]},
@@ -349,6 +352,13 @@ def test_hyperlink_hide_and_measure(tmp_path: Path):
                 "action": "table_create",
                 "args": {"sheetName": "Sheet1", "tableName": "Data", "rangeAddress": "A1:B3", "hasHeaders": True},
             },
+        ],
+        "excel_table",
+    )
+    assert table["ok"] is True, table
+    view, _ = _apply(
+        path,
+        [
             {
                 "action": "hyperlink_add",
                 "args": {
@@ -361,6 +371,13 @@ def test_hyperlink_hide_and_measure(tmp_path: Path):
             {"action": "create_sheet", "name": "Side"},
             {"action": "sheet_hide", "sheet": "Side"},
             {"action": "sheet_show", "sheet": "Side"},
+        ],
+        "excel_view",
+    )
+    assert view["ok"] is True, view
+    model, _ = _apply(
+        path,
+        [
             {"action": "table_add_to_data_model", "args": {"tableName": "Data"}},
             {
                 "action": "datamodel_create_measure",
@@ -371,8 +388,9 @@ def test_hyperlink_hide_and_measure(tmp_path: Path):
                 },
             },
         ],
+        "excel_model",
     )
-    assert body["ok"] is True, body
+    assert model["ok"] is True, model
 
 
 def test_protected_insert_is_not_committed(tmp_path: Path):
@@ -409,6 +427,7 @@ def test_font_change_on_pivot_workbook_uses_com_and_keeps_pivot(tmp_path: Path):
                 },
             },
         ],
+        "excel_table",
     )
     assert setup["committed"] is True, setup
     info = inspect_workbook(str(path))
@@ -428,6 +447,7 @@ def test_xlsm_roundtrip_keeps_vba_part(tmp_path: Path):
     imported, _ = _apply(
         path,
         [{"action": "vba_import", "module": "Mod1", "code": "Sub Ping()\nEnd Sub\n"}],
+        "excel_vba",
     )
     assert imported["committed"] is True, imported
     with zipfile.ZipFile(path) as archive:
@@ -436,15 +456,19 @@ def test_xlsm_roundtrip_keeps_vba_part(tmp_path: Path):
     assert body["committed"] is True, body
     with zipfile.ZipFile(path) as archive:
         assert archive.read("xl/vbaProject.bin") == before
-    viewed, _ = _apply(path, [{"action": "vba_view", "module": "Mod1"}])
-    assert viewed["committed"] is True, viewed
+    unchanged = file_hash(str(path))
+    viewed, shots = _apply(path, [{"action": "vba_view", "module": "Mod1"}], "excel_vba")
+    assert viewed["ok"] is True and viewed["readOnly"] is True, viewed
+    assert viewed["committed"] is False and shots == []
+    assert "Ping" in json.dumps(viewed["results"][0]["result"], ensure_ascii=False)
+    assert file_hash(str(path)) == unchanged
 
 
 def test_table_chart_validation_comment_and_query(tmp_path: Path):
     _require_excel()
     path = tmp_path / "phase4.xlsx"
     _create(path)
-    body, _ = _apply(
+    table, _ = _apply(
         path,
         [
             {"action": "set_values", "sheet": "Sheet1", "range": "A1", "values": [["n", "v"], [1, 2], [3, 4]]},
@@ -462,6 +486,16 @@ def test_table_chart_validation_comment_and_query(tmp_path: Path):
                     "targetRange": "D2:H12",
                 },
             },
+            {"action": "table_list"},
+        ],
+        "excel_table",
+    )
+    assert table["ok"] is True, table
+    assert [item["action"] for item in table["results"]] == ["table_list"]
+    assert "Data" in json.dumps(table["results"][0]["result"])
+    view, _ = _apply(
+        path,
+        [
             {
                 "action": "validation_add",
                 "args": {
@@ -485,6 +519,13 @@ def test_table_chart_validation_comment_and_query(tmp_path: Path):
                 },
             },
             {"action": "freeze", "sheet": "Sheet1", "rows": 1, "columns": 0},
+        ],
+        "excel_view",
+    )
+    assert view["ok"] is True, view
+    model, _ = _apply(
+        path,
+        [
             {
                 "action": "powerquery_create",
                 "args": {
@@ -494,7 +535,49 @@ def test_table_chart_validation_comment_and_query(tmp_path: Path):
                 },
             },
         ],
+        "excel_model",
     )
-    assert body["ok"] is True, body
-    comment = workbook_read(str(path), sheet="Sheet1", range="A4")[0]
+    assert model["ok"] is True, model
+    comment = read_workbook(str(path), sheet="Sheet1", range="A4")
     assert comment["ok"] is True
+
+
+def test_batched_failure_reports_the_failing_op_and_keeps_bytes(tmp_path: Path):
+    _require_excel()
+    path = tmp_path / "batch.xlsx"
+    _create(path)
+    before = file_hash(str(path))
+    body, _ = _apply(
+        path,
+        [
+            {"action": "insert_rows", "sheet": "Sheet1", "row": 1, "count": 1},
+            {"action": "delete_sheet", "sheet": "Missing"},
+            {"action": "insert_rows", "sheet": "Sheet1", "row": 1, "count": 1},
+        ],
+    )
+    assert body["committed"] is False
+    assert body["failedAt"] == 1, body
+    assert body["completedOps"] == 1
+    assert file_hash(str(path)) == before
+
+
+def test_trim_sheet_drops_formatting_past_the_data(tmp_path: Path):
+    _require_excel()
+    path = tmp_path / "trim.xlsx"
+    _create(path)
+    workbook = load_workbook(path)
+    ws = workbook["Sheet1"]
+    ws["A1"] = "keep"
+    ws["B3"] = "=A1"
+    for row in range(1, 60):
+        ws.cell(row, 40).font = Font(bold=True)
+    ws.column_dimensions["AZ"].width = 25
+    workbook.save(path)
+    workbook.close()
+    assert read_workbook(str(path), mode="overview")["sheets"][0]["extent"] == "A1:AZ59"
+    body, _ = _apply(path, [{"action": "trim_sheet", "sheet": "Sheet1"}])
+    assert body["committed"] is True, body
+    sheet = read_workbook(str(path), mode="overview")["sheets"][0]
+    assert sheet["usedRange"] == "A1:B3"
+    assert "extent" not in sheet, sheet
+    assert _formula(path, "Sheet1", "B3") == "=A1"

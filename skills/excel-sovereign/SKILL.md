@@ -18,14 +18,26 @@ description: 用六个短入口修改本地 xlsx 和 xlsm。服务端选择引�
 
 六个入口。参数都是工作簿路径和 `ops`，不要把别的模块的动作塞进同一次调用。同一模块、同一文件合成一次。服务端选择引擎。调用返回前已经截图，不要再单独要图。
 
-- `workbook_read`：值、公式、缓存值。默认最多 4000 格，用 `nextRange` 继续。不截图。
-- `workbook_apply`：值、公式、名称、排版、工作表结构、`layout`。
+- `workbook_read`：值、公式、缓存值。不截图。每页最多 4000 格，用 `nextRange` 继续。
+  - 陌生工作簿先用 `mode:"overview"`：每页的实际数据范围、非空格数、公式数、合并区、冻结和隐藏状态；加 `preview:N` 附带前 N 个非空行。
+  - 默认 `mode:"sparse"`：只返回非空格，按行分组 `rows:{"5":{"A":值,"C":{"f":"=..","v":缓存}}}`，另附合并区。`limit` 计非空格。
+  - 要按 `set_values` 的二维形状写回时用 `mode:"dense"`；整页无公式时不返回 `formulas`。
+  - 找字段、找引用用 `mode:"find","find":"关键字"`：跨页搜值和公式文本，可限定 `sheet`/`range`。
+  - 长文本加 `maxText` 截断。
+  - 文件在 Excel 里开着也能读，读到的是最后一次保存的内容，返回 `openInExcel: true`。
+- `workbook_apply`：值、公式、名称、排版、工作表结构、`layout`、`trim_sheet`。
 - `excel_table`：表、透视表、图表、切片器。
 - `excel_model`：Power Query、数据模型、DAX。
 - `excel_view`：条件格式、数据验证、批注、超链接、冻结、隐藏工作表。
 - `excel_vba`：VBA。只有这次调用才允许宏。Excel 需要信任对 VBA 工程对象模型的访问。
 
 动作名在对应工具的说明里。其余字段直接写在 op 上。送错工具会返回 `wrong_tool`，并给出该用的工具名。
+
+后四个工具也接受 `workbook_apply` 的值、公式、排版和工作表结构动作，所以“先填数据再建表/图”放在同一次 `excel_table` 调用里，只开一次 Excel。
+
+查询类动作（`*_list`、`table_read`、`powerquery_view`、`datamodel_evaluate`、`validation_get`、`comment_get`、`vba_view`）的结果在返回的 `results` 里，按 `op` 下标对应。整次调用全是查询时不保存、不截图，返回 `readOnly: true`。
+
+`overview` 里出现 `extent` 表示数据之外还有残留格式；用 `{"action":"trim_sheet","sheet":"表名"}` 删掉最后一个非空格之后的行列。
 
 ## 返回
 

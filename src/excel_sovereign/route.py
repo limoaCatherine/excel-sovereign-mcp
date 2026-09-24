@@ -131,8 +131,29 @@ COM_COMMANDS: dict[str, str] = {
 }
 
 VBA_ACTIONS = {name for name in COM_COMMANDS if name.startswith("vba_")}
-KNOWN_ACTIONS = set(COM_COMMANDS) | {"verify", "create_workbook", "define_name_update"}
 COM_COMMANDS["define_name_update"] = "namedrange.update"
+# Expanded into delete_rows / delete_columns before routing.
+EXPANDED_ACTIONS = {"trim_sheet"}
+KNOWN_ACTIONS = set(COM_COMMANDS) | {"verify", "create_workbook"} | EXPANDED_ACTIONS
+
+# These return data and change nothing. A call made only of them opens, reads, and closes without saving.
+QUERY_ACTIONS = {
+    "table_list",
+    "table_read",
+    "pivot_list",
+    "chart_list",
+    "slicer_list",
+    "powerquery_list",
+    "powerquery_view",
+    "datamodel_list_tables",
+    "datamodel_list_measures",
+    "datamodel_evaluate",
+    "conditional_format_list",
+    "validation_get",
+    "comment_get",
+    "vba_list",
+    "vba_view",
+}
 
 _MODEL_TABLE = {"table_add_to_data_model", "table_create_from_dax"}
 _TABLE_PREFIXES = ("table_", "pivot_", "chart_", "slicer_")
@@ -156,26 +177,40 @@ _VIEW_ACTIONS = {
     "sheet_show",
 }
 
-# Tool name selects the action family. It does not select the engine.
-TOOL_ACTIONS: dict[str, set[str]] = {
-    "workbook_apply": STYLE_ACTIONS
+# Cell, style, and sheet-structure actions ride along on every tool, so seeding data and
+# building a table on it is one Excel session instead of two.
+CORE_ACTIONS = (
+    STYLE_ACTIONS
     | VALUE_ACTIONS
     | FORMULA_ACTIONS
     | OPENPYXL_SHEET_ACTIONS
     | STRUCTURE_ACTIONS
-    | {"define_name_update", "layout", "verify"},
+    | {"define_name_update", "verify"}
+)
+
+# Tool name selects the action family. It does not select the engine.
+TOOL_ACTIONS: dict[str, set[str]] = {
+    "workbook_apply": CORE_ACTIONS | EXPANDED_ACTIONS | {"layout"},
     "excel_table": {
         name
         for name in COM_COMMANDS
         if name.startswith(_TABLE_PREFIXES) and name not in _MODEL_TABLE
     }
-    | {"verify"},
+    | CORE_ACTIONS,
     "excel_model": {name for name in COM_COMMANDS if name.startswith(_MODEL_PREFIXES)}
     | _MODEL_TABLE
-    | {"verify"},
-    "excel_view": set(_VIEW_ACTIONS) | {"verify"},
-    "excel_vba": set(VBA_ACTIONS) | {"verify"},
+    | CORE_ACTIONS,
+    "excel_view": set(_VIEW_ACTIONS) | CORE_ACTIONS,
+    "excel_vba": set(VBA_ACTIONS) | CORE_ACTIONS,
 }
+
+
+def _owners() -> dict[str, str]:
+    owners: dict[str, str] = {}
+    for name, actions in TOOL_ACTIONS.items():
+        for action in actions:
+            owners.setdefault(action, name)
+    return owners
 
 
 def action_outside(tool: str, ops: list[dict]) -> tuple[str, str] | None:
@@ -183,18 +218,17 @@ def action_outside(tool: str, ops: list[dict]) -> tuple[str, str] | None:
     allowed = TOOL_ACTIONS.get(tool)
     if allowed is None:
         return None
-    owners = {
-        action: name
-        for name, actions in TOOL_ACTIONS.items()
-        for action in actions
-        if action != "verify"
-    }
+    owners = _owners()
     for op in ops:
         action = op["action"]
-        if action in allowed or (action not in KNOWN_ACTIONS and action != "layout"):
+        if action in allowed or action not in owners:
             continue
-        return action, owners.get(action, "workbook_apply")
+        return action, owners[action]
     return None
+
+
+def is_query(ops: list[dict]) -> bool:
+    return bool(ops) and all(op["action"] in QUERY_ACTIONS for op in ops)
 
 # These excelcli actions open files and save outside the session. They are not mapped.
 IMMEDIATE_SAVE_BLOCKED = {"sheet.copy-to-file", "sheet.move-to-file"}
@@ -301,6 +335,8 @@ def decide(ops: list[dict], info: PackageInfo | None) -> RouteDecision:
     if any(op["action"] == "verify" for op in ops):
         return RouteDecision("com", True, False, "verify")
     allow_macros = any(op["action"] in VBA_ACTIONS for op in ops)
+    if is_query(ops):
+        return RouteDecision("com", False, allow_macros, "query")
     openpyxl_actions = STYLE_ACTIONS | VALUE_ACTIONS | FORMULA_ACTIONS | OPENPYXL_SHEET_ACTIONS
     needs_com = (
         info.has_com_parts

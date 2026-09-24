@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -15,6 +16,7 @@ from excel_sovereign.book import (
     read_page,
     replace_target,
     save_atomic,
+    trim_ops,
 )
 from excel_sovereign.excel_cli import COM_QUEUE, ComSession, ExcelCliError
 from excel_sovereign.inspect import is_encrypted_or_irm, inspect_workbook
@@ -23,6 +25,7 @@ from excel_sovereign.lock import FileLock, LockTimeout, canonical_path, file_is_
 from excel_sovereign.route import (
     COM_COMMANDS,
     MAX_WRITE_CELLS,
+    QUERY_ACTIONS,
     RouteDecision,
     com_args,
     count_cells,
@@ -36,9 +39,9 @@ from excel_sovereign.verify import (
     VerifyOutcome,
     _object_anchors,
     calculate,
-    capture_range,
+    capture_ranges,
     plan_sheets,
-    spill_address,
+    spill_addresses,
     union_ranges,
 )
 
@@ -105,7 +108,7 @@ def _response(
     verified = bool(
         outcome
         and outcome.error is None
-        and shots
+        and (shots or outcome.nothing_to_show)
         and not omitted
         and not spill_unknown
         and not cropped
@@ -161,9 +164,17 @@ def _track(ops: list[dict]) -> tuple[list[dict], list[dict], list[str], dict[str
         if sheet and sheet not in touched:
             touched.append(sheet)
 
+    def forget(name: str) -> None:
+        wrote[:] = [item for item in wrote if item["sheet"] != name]
+        formulas[:] = [item for item in formulas if item["sheet"] != name]
+        if name in touched:
+            touched.remove(name)
+
     for op in ops:
         action = op["action"]
-        sheet = str(op.get("sheet") or "")
+        args = op.get("args") if isinstance(op.get("args"), dict) else {}
+        sheet = str(op.get("sheet") or args.get("sheetName") or "")
+        target = op.get("range") or op.get("cell") or args.get("rangeAddress") or args.get("cellAddress")
         if action in {"insert_rows", "delete_rows", "insert_columns", "delete_columns"} and sheet:
             for item in wrote:
                 if item["sheet"] == sheet:
@@ -198,13 +209,19 @@ def _track(ops: list[dict]) -> tuple[list[dict], list[dict], list[str], dict[str
             remember(sheet)
             for cell, formula in _formula_cells(sheet, str(op.get("range")), op.get("formulas") or []):
                 formulas.append({"sheet": sheet, "cell": cell, "formula": formula})
-        elif op.get("range") and sheet:
-            wrote.append({"sheet": sheet, "range": str(op["range"])})
+        elif action in {"delete_sheet", "sheet_hide"}:
+            # Nothing left to photograph on a deleted or hidden sheet.
+            forget(str(sheet or op.get("name") or ""))
+        elif action in {"create_sheet", "copy_sheet", "move_sheet", "sheet_show", "freeze", "unfreeze"}:
+            name = str(op.get("newName") or op.get("name") or args.get("targetName") or sheet)
+            if action == "copy_sheet" and not op.get("newName") and not args.get("targetName"):
+                name = str(op.get("source") or args.get("sourceName") or sheet)
+            if name:
+                wrote.append({"sheet": name, "range": "A1:L40"})
+                remember(name)
+        elif target and sheet:
+            wrote.append({"sheet": sheet, "range": str(target)})
             remember(sheet)
-        elif action == "create_sheet":
-            remember(str(op.get("name") or sheet))
-        elif action in {"copy_sheet", "delete_sheet"}:
-            remember(str(op.get("newName") or op.get("source") or sheet))
         elif action in {"insert_rows", "delete_rows"}:
             row = int(op["row"])
             count = int(op.get("count") or 1)
@@ -270,28 +287,22 @@ def _run_verify(
         if explicit_ranges:
             ranges.update(explicit_ranges)
         spill_unknown = False
-        for item in formula_cells:
-            supported, address = spill_address(session, item["sheet"], item["cell"])
+        probes = [(item["sheet"], item["cell"]) for item in formula_cells]
+        for (sheet, _), (supported, address) in zip(probes, spill_addresses(session, probes)):
             if not supported:
                 spill_unknown = True
                 continue
             if address:
-                ranges[item["sheet"]] = union_ranges([ranges.get(item["sheet"], address), address]) or address
+                ranges[sheet] = union_ranges([ranges.get(sheet, address), address]) or address
         outcome.spill_unknown = spill_unknown
         if not ranges and touched:
-            for sheet in touched:
-                shot = capture_range(session, sheet, "A1:L40")
+            for shot in capture_ranges(session, [(sheet, "A1:L40") for sheet in touched]):
                 shot.cropped = True
                 shot.spill_unknown = spill_unknown
                 outcome.shots.append(shot)
-        for sheet, address in ranges.items():
-            if not address:
-                continue
-            shot = capture_range(session, sheet, address)
+        for shot in capture_ranges(session, [(sheet, address) for sheet, address in ranges.items() if address]):
             shot.spill_unknown = spill_unknown
             outcome.shots.append(shot)
-        if spill_unknown or omitted or any(shot.cropped for shot in outcome.shots):
-            outcome.error = outcome.error
         reasons = []
         if spill_unknown:
             reasons.append("spill range unavailable")
@@ -299,7 +310,9 @@ def _run_verify(
             reasons.append("dependent ranges omitted")
         if any(shot.cropped for shot in outcome.shots):
             reasons.append("screenshot cropped")
-        if not outcome.shots:
+        if not outcome.shots and not ranges and not touched:
+            outcome.nothing_to_show = True
+        elif not outcome.shots:
             reasons.append("no screenshot range")
         if reasons:
             outcome.error = "; ".join(reasons)
@@ -363,6 +376,13 @@ def apply_workbook(path: str, ops: list[dict], tool: str = "workbook_apply") -> 
     try:
         if file_is_locked(path):
             return _error("file_locked", "workbook is open in Excel or another process", path=path), []
+        if any(op["action"] == "trim_sheet" for op in ops):
+            try:
+                ops = _expand_trims(path, ops)
+            except KeyError as exc:
+                return _error("invalid_ops", str(exc).strip("'\""), path=path), []
+            if not ops:
+                return _nothing_to_do(path, "sheet already ends at its last non-empty cell"), []
         info = inspect_workbook(path)
         if ops and ops[0]["action"] == "verify" and len(ops) == 1:
             decision = RouteDecision("com", True, False, "verify")
@@ -375,6 +395,35 @@ def apply_workbook(path: str, ops: list[dict], tool: str = "workbook_apply") -> 
         return body, shots
     finally:
         lock.release()
+
+
+def _expand_trims(path: str, ops: list[dict]) -> list[dict]:
+    expanded = []
+    for op in ops:
+        if op["action"] != "trim_sheet":
+            expanded.append(op)
+            continue
+        sheet = str(op.get("sheet") or "")
+        if not sheet:
+            raise KeyError("trim_sheet needs sheet")
+        expanded.extend(trim_ops(path, sheet))
+    return expanded
+
+
+def _nothing_to_do(path: str, note: str) -> dict:
+    return {
+        "ok": True,
+        "committed": False,
+        "saved": False,
+        "verified": False,
+        "calculated": False,
+        "calc": "skipped",
+        "engine": None,
+        "path": path,
+        "completedOps": 0,
+        "failedAt": None,
+        "note": note,
+    }
 
 
 def _apply_openpyxl(path: str, ops: list[dict], tool: str, decision: RouteDecision, lock: FileLock):
@@ -533,7 +582,8 @@ def _apply_com(path: str, ops: list[dict], tool: str, decision: RouteDecision, l
         return _verify_only(path, ops[0], tool, lock)
     wrote, formulas, touched, renamed = _track(ops)
     commands = []
-    for op in ops:
+    op_index = []
+    for index, op in enumerate(ops):
         if op["action"] == "create_workbook":
             continue
         command = COM_COMMANDS.get(op["action"])
@@ -548,13 +598,14 @@ def _apply_com(path: str, ops: list[dict], tool: str, decision: RouteDecision, l
                 wrote=[],
                 outcome=None,
                 completed=0,
-                failed_at=0,
+                failed_at=index,
                 error={"code": "unsupported", "message": op["action"]},
-            ), []
+            )
         commands.append({"command": command, "args": com_args(op)})
+        op_index.append(index)
+    query_only = decision.reason == "query"
     slow = {"table_add_to_data_model", "table_create_from_dax"}
     timeout = 600 if any(op["action"].startswith(("powerquery", "datamodel")) or op["action"] in slow for op in ops) else None
-    completed = 0
     with COM_QUEUE:
         session = ComSession(path, allow_macros=decision.allow_macros, timeout=timeout)
         try:
@@ -577,27 +628,35 @@ def _apply_com(path: str, ops: list[dict], tool: str, decision: RouteDecision, l
                 failed_at=0,
                 error={"code": code, "message": str(exc)},
             )
-        for index, command in enumerate(commands):
+        try:
+            results = session.call(commands) if commands else []
+        except ExcelCliError as exc:
+            freed = session.abort()
+            if not freed:
+                lock.retain_until_file_free()
+            failed = exc.index if exc.index is not None and exc.index < len(op_index) else 0
+            body, shots = _response(
+                path=path,
+                engine="com",
+                tool=tool,
+                committed=False,
+                calc="skipped",
+                calc_required=decision.calc_required,
+                wrote=[] if query_only else wrote,
+                outcome=None,
+                completed=failed,
+                failed_at=op_index[failed] if op_index else 0,
+                error={"code": "op_failed", "message": str(exc)},
+            )
+            return _with_results(body, ops, op_index, exc.results), shots
+        completed = len(commands)
+        if query_only:
             try:
-                session.call([command])
-                completed = index + 1
-            except ExcelCliError as exc:
-                freed = session.abort()
-                if not freed:
+                session.close(save=False)
+            except ExcelCliError:
+                if not session.abort():
                     lock.retain_until_file_free()
-                return _response(
-                    path=path,
-                    engine="com",
-                    tool=tool,
-                    committed=False,
-                    calc="skipped",
-                    calc_required=decision.calc_required,
-                    wrote=wrote,
-                    outcome=None,
-                    completed=completed,
-                    failed_at=index,
-                    error={"code": "op_failed", "message": str(exc)},
-                )
+            return _query_response(path, completed, _results_of(ops, op_index, results)), []
         outcome = _run_verify(
             session,
             path,
@@ -646,7 +705,7 @@ def _apply_com(path: str, ops: list[dict], tool: str, decision: RouteDecision, l
     error = {"code": "verify_failed", "message": outcome.error} if outcome.error else None
     if decision.calc_required and outcome.calc != "done":
         error = error or {"code": "calc_failed", "message": outcome.error or "calculation failed"}
-    return _response(
+    body, shots = _response(
         path=path,
         engine="com",
         tool=tool,
@@ -659,6 +718,57 @@ def _apply_com(path: str, ops: list[dict], tool: str, decision: RouteDecision, l
         failed_at=None,
         error=error,
     )
+    return _with_results(body, ops, op_index, results), shots
+
+
+_RESULT_NOISE = {"success", "filePath", "sessionId"}
+
+
+def _results_of(ops: list[dict], op_index: list[int], results: list[dict]) -> list[dict]:
+    """Payloads of query ops, keyed back to their position in the caller's ops."""
+    found = []
+    for item in results:
+        position = item.get("index")
+        if not isinstance(position, int) or position >= len(op_index):
+            continue
+        index = op_index[position]
+        action = ops[index]["action"]
+        if action not in QUERY_ACTIONS or not item.get("success", True):
+            continue
+        payload = item.get("result")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                pass
+        if isinstance(payload, dict):
+            payload = {key: value for key, value in payload.items() if key not in _RESULT_NOISE}
+        found.append({"op": index, "action": action, "result": payload})
+    return found
+
+
+def _with_results(body: dict, ops: list[dict], op_index: list[int], results: list[dict]) -> dict:
+    found = _results_of(ops, op_index, results)
+    if found:
+        body["results"] = found
+    return body
+
+
+def _query_response(path: str, completed: int, results: list[dict]) -> dict:
+    return {
+        "ok": True,
+        "committed": False,
+        "saved": False,
+        "verified": False,
+        "calculated": False,
+        "calc": "skipped",
+        "engine": "com",
+        "path": path,
+        "completedOps": completed,
+        "failedAt": None,
+        "readOnly": True,
+        "results": results,
+    }
 
 
 def _verify_only(path: str, op: dict, tool: str, lock: FileLock):
@@ -730,8 +840,13 @@ def _verify_only(path: str, op: dict, tool: str, lock: FileLock):
     )
 
 
+def _compact(body: dict) -> str:
+    # The MCP fallback serializer indents by 2, which puts every null of a dense page on its own line.
+    return json.dumps(body, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
 def _with_images(body: dict, shots: list) -> list:
-    content: list[Any] = [body]
+    content: list[Any] = [_compact(body)]
     for shot in shots:
         if not getattr(shot, "data", None):
             continue
@@ -747,33 +862,76 @@ def workbook_read(
     range: str | None = None,
     includeStyles: bool = False,
     limit: int = READ_LIMIT,
+    mode: str = "sparse",
+    preview: int = 0,
+    maxText: int | None = None,
+    find: str | None = None,
 ) -> list:
     """Read values, formulas, and cached values. Takes the workbook lock. Does not screenshot.
 
-    Pass the same ops shape you would write back when includeStyles is true.
-    Results are paged. Follow nextRange until it is null. Default page is 4000 cells.
-    Do not read a file that is open in Excel; close it first.
+    mode=overview: every sheet (or `sheet`) with usedRange, cell/formula/merged counts, freeze, state.
+      preview=N adds the first N non-empty rows per sheet (text clipped to 40 unless maxText).
+      Start here on an unfamiliar workbook.
+    mode=sparse (default): only non-empty cells, grouped by row: rows {"5": {"A": v, "C": {"f": "=..", "v": cached}}}.
+      Plain cells are bare values; formula cells are {f, v}; includeStyles adds "s". Also lists merged ranges.
+      limit counts non-empty cells; pages end on a row boundary.
+    mode=dense: row-major 2D values (+formulas only if the page has any, +styles), the shape set_values takes.
+      limit counts every cell in the rectangle.
+    mode=find: cells whose value or formula text contains `find` (case-insensitive), across every sheet
+      or just `sheet`, optionally inside `range`. limit caps matches; truncated says there were more.
+    Without range the page runs from A1 to the last non-empty cell. maxText clips long strings.
+    Follow nextRange until it is null. Page cap is 4000 cells.
+    A workbook open in Excel is read from its last saved state and the page says openInExcel: true.
     """
+    return [_compact(read_workbook(path, sheet, range, includeStyles, limit, mode, preview, maxText, find))]
+
+
+def read_workbook(
+    path: str,
+    sheet: str | None = None,
+    range: str | None = None,
+    includeStyles: bool = False,
+    limit: int = READ_LIMIT,
+    mode: str = "sparse",
+    preview: int = 0,
+    maxText: int | None = None,
+    find: str | None = None,
+) -> dict:
     full = canonical_path(path)
     bad = _extension(full)
     if bad:
-        return [_error("unsupported_format", f"only .xlsx and .xlsm are accepted, got {bad}", path=full)]
+        return _error("unsupported_format", f"only .xlsx and .xlsm are accepted, got {bad}", path=full)
     if not os.path.exists(full):
-        return [_error("not_found", "workbook does not exist", path=full)]
+        return _error("not_found", "workbook does not exist", path=full)
     if is_encrypted_or_irm(full):
-        return [_error("encrypted_or_irm", "encrypted or IRM workbooks are rejected", path=full)]
+        return _error("encrypted_or_irm", "encrypted or IRM workbooks are rejected", path=full)
     try:
         with FileLock(full):
-            if file_is_locked(full):
-                return [_error("file_locked", "workbook is open in Excel or another process", path=full)]
-            page = read_page(full, sheet, range, includeStyles, min(limit, READ_LIMIT))
+            open_elsewhere = file_is_locked(full)
+            try:
+                page = read_page(
+                    full,
+                    sheet,
+                    range,
+                    includeStyles,
+                    max(1, min(limit, READ_LIMIT)),
+                    mode=mode,
+                    preview=max(0, preview),
+                    max_text=maxText,
+                    find=find,
+                )
+            except PermissionError:
+                return _error("file_locked", "workbook is open in another process that blocks reading", path=full)
     except LockTimeout:
-        return [_error("lock_timeout", "timed out waiting for the workbook lock", path=full)]
+        return _error("lock_timeout", "timed out waiting for the workbook lock", path=full)
     except Exception as exc:
-        return [_error("op_failed", str(exc), path=full)]
+        return _error("op_failed", str(exc), path=full)
     page["ok"] = True
     page["path"] = full
-    return [page]
+    if open_elsewhere:
+        # Unsaved edits in Excel are not visible here.
+        page["openInExcel"] = True
+    return page
 
 
 def _apply(path: str, ops: list[dict[str, Any]], tool: str) -> list:
@@ -788,10 +946,13 @@ def workbook_apply(path: str, ops: list[dict[str, Any]]) -> list:
     Actions: set_values, set_formulas, clear_contents, clear_all, format, merge, unmerge,
     set_row_height, set_column_width, define_name, define_name_update, create_workbook,
     create_sheet, rename_sheet, copy_sheet, move_sheet, delete_sheet, insert_rows, delete_rows,
-    insert_columns, delete_columns, insert_cells, delete_cells, layout, verify.
-    One file per call. Tables, pivots, charts, queries, the data model, and VBA have their own tools.
+    insert_columns, delete_columns, insert_cells, delete_cells, trim_sheet, layout, verify.
+    One file per call. Tables, pivots, charts, queries, the data model, and VBA have their own tools;
+    those tools also accept the cell, format, and sheet actions above, so seed data and build on it in one call.
     English formulas. Excel number formats. Close the file in Excel first. Do not repeat a committed insert.
     layout starts a sheet. profile is finance, analytics, or general. A fact block becomes an Excel table.
+    trim_sheet {sheet}: deletes the rows and columns past the last non-empty cell (leftover formatting).
+    workbook_read mode=overview shows it as extent beyond usedRange.
     """
     return _apply(path, ops, "workbook_apply")
 
@@ -804,8 +965,9 @@ def excel_table(path: str, ops: list[dict[str, Any]]) -> list:
     table_delete, table_set_style, table_apply_filter, table_clear_filters, pivot_list,
     pivot_create_from_range, pivot_create_from_table, pivot_refresh, pivot_delete, chart_list,
     chart_create_from_range, chart_create_from_table, chart_move, chart_fit, chart_delete,
-    slicer_list, slicer_create, slicer_delete, verify.
+    slicer_list, slicer_create, slicer_delete, verify. Also the workbook_apply cell/format/sheet actions.
     Put command fields on the op. Do not paint a table body with format.
+    *_list and table_read return data under results. A call made only of them does not save or screenshot.
     """
     return _apply(path, ops, "excel_table")
 
@@ -818,7 +980,9 @@ def excel_model(path: str, ops: list[dict[str, Any]]) -> list:
     powerquery_refresh, powerquery_refresh_all, powerquery_delete, powerquery_rename,
     datamodel_list_tables, datamodel_list_measures, datamodel_create_measure,
     datamodel_update_measure, datamodel_delete_measure, datamodel_evaluate, datamodel_refresh,
-    table_add_to_data_model, table_create_from_dax, verify.
+    table_add_to_data_model, table_create_from_dax, verify. Also the workbook_apply cell/format/sheet actions.
+    *_list, powerquery_view, and datamodel_evaluate return data under results.
+    A call made only of them does not save or screenshot.
     """
     return _apply(path, ops, "excel_model")
 
@@ -830,7 +994,9 @@ def excel_view(path: str, ops: list[dict[str, Any]]) -> list:
     Actions: conditional_format_add, conditional_format_clear, conditional_format_list,
     validation_add, validation_get, validation_remove, comment_set, comment_get, comment_clear,
     threaded_comment_add, hyperlink_add, hyperlink_remove, freeze, unfreeze, sheet_hide,
-    sheet_show, verify.
+    sheet_show, verify. Also the workbook_apply cell/format/sheet actions.
+    conditional_format_list, validation_get, and comment_get return data under results.
+    A call made only of them does not save or screenshot.
     """
     return _apply(path, ops, "excel_view")
 
@@ -840,6 +1006,8 @@ def excel_vba(path: str, ops: list[dict[str, Any]]) -> list:
     """List, view, import, update, run, or delete VBA. Macros are enabled only on this tool.
 
     Actions: vba_list, vba_view, vba_import, vba_update, vba_run, vba_delete, verify.
+    Also the workbook_apply cell/format/sheet actions.
+    vba_list and vba_view return data under results and, alone, do not save or screenshot.
     Excel must trust access to the VBA project object model.
     """
     return _apply(path, ops, "excel_vba")

@@ -12,7 +12,17 @@ from openpyxl import Workbook
 from excel_sovereign.book import apply_ops, file_hash, load_for_edit, save_atomic
 from excel_sovereign.inspect import inspect_workbook
 from excel_sovereign.lock import FileLock, canonical_path
-from excel_sovereign.route import KNOWN_ACTIONS, TOOL_ACTIONS, action_outside, com_args, count_cells, decide, normalize_ops
+from excel_sovereign.route import (
+    CORE_ACTIONS,
+    KNOWN_ACTIONS,
+    QUERY_ACTIONS,
+    TOOL_ACTIONS,
+    action_outside,
+    com_args,
+    count_cells,
+    decide,
+    normalize_ops,
+)
 from excel_sovereign.server import _response, apply_workbook
 from excel_sovereign.verify import VerifyOutcome
 
@@ -208,16 +218,24 @@ def test_canonical_path_folds_case():
     assert canonical_path("C:/Temp/A.xlsx") == canonical_path("c:/temp/a.xlsx")
 
 
-def test_actions_belong_to_one_tool():
+def test_family_actions_belong_to_one_tool_and_core_rides_everywhere():
     owners = {}
     for tool, actions in TOOL_ACTIONS.items():
-        assert "verify" in actions
-        for action in actions:
-            if action == "verify":
-                continue
+        assert CORE_ACTIONS <= actions, tool
+        for action in actions - CORE_ACTIONS:
             assert action not in owners, action
             owners[action] = tool
-    assert KNOWN_ACTIONS | {"layout"} <= set(owners) | {"verify"}
+    assert KNOWN_ACTIONS | {"layout"} <= set(owners) | CORE_ACTIONS
+    assert action_outside("excel_table", [{"action": "set_values"}, {"action": "table_create"}]) is None
+    assert action_outside("excel_table", [{"action": "vba_import"}]) == ("vba_import", "excel_vba")
+    assert action_outside("excel_view", [{"action": "trim_sheet"}]) == ("trim_sheet", "workbook_apply")
+
+
+def test_query_only_calls_route_read_only():
+    assert decide(normalize_ops([{"action": "table_list"}, {"action": "vba_view"}]), None).reason == "query"
+    mixed = decide(normalize_ops([{"action": "table_list"}, {"action": "table_create"}]), None)
+    assert mixed.reason != "query"
+    assert QUERY_ACTIONS <= KNOWN_ACTIONS
 
 
 def test_other_family_is_rejected_before_write(tmp_path: Path):
