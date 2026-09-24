@@ -15,19 +15,30 @@ python -m pip install -e .
 dotnet build vendor\mcp-server-excel\src\ExcelMcp.CLI\ExcelMcp.CLI.csproj -c Release
 ```
 
-`dotnet build` 需要 .NET 10 SDK。编出的 `excelcli.exe` 留在本机构建目录，不进版本库。已经编过也可以用环境变量 `EXCELCLI` 指向它。
+`dotnet build` 需要 .NET 10 SDK。编出的 `excelcli.exe` 留在本机构建目录，不进版本库。已经编过也可以用环境变量 `EXCELCLI` 指向它。找不到时，服务会到上面的构建目录里找。
 
-Cursor 里这样注册：
+用 Cursor 打开本仓库时，`.cursor/mcp.json` 会注册名为 `excelMCP` 的服务。它运行 `scripts/serve.py`。这个脚本按自己的位置把 `src` 放进模块路径，并固定走 stdio。
+
+不要只把命令写成 `excel-sovereign-mcp`。那个入口在 `pip install -e .` 之后落在 Python 的 `Scripts` 目录。Cursor 从开始菜单启动时，这个目录经常不在 PATH 里。进程一起就退出，重启后工具列表是空的。
+
+在别的窗口里也要用时，写到用户级 `mcp.json`，路径用绝对路径：
 
 ```json
 {
   "mcpServers": {
-    "excel-sovereign": {
-      "command": "excel-sovereign-mcp"
+    "excelMCP": {
+      "type": "stdio",
+      "command": "C:\\Path\\to\\python.exe",
+      "args": ["C:\\Path\\to\\excel-sovereign-mcp\\scripts\\serve.py"],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
     }
   }
 }
 ```
+
+`type` 要写 `stdio`。同一台机器上用户级配置和本仓库配置会各出现一条 `excelMCP`。在本仓库里用项目这一条，在其他窗口里用用户级这一条。
 
 调用前先在 Excel 里保存并关闭同一个文件。公式用英文函数名。数字格式用 Excel 格式码。
 

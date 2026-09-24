@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "excelMCP": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["scripts/serve.py"],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}

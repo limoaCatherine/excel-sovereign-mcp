@@ -42,7 +42,15 @@ from excel_sovereign.verify import (
     union_ranges,
 )
 
-mcp = MCPServer("excel-sovereign-mcp")
+mcp = MCPServer(
+    "excel-sovereign-mcp",
+    title="excelMCP",
+    instructions=(
+        "Local Excel server with six tools and one ops list. "
+        "The server chooses openpyxl or Excel, saves once, and screenshots. "
+        "Close the workbook in Excel before calling."
+    ),
+)
 
 READ_LIMIT = 4000
 ALLOWED = {".xlsx", ".xlsm"}
@@ -838,7 +846,7 @@ def excel_vba(path: str, ops: list[dict[str, Any]]) -> list:
 
 
 def main() -> None:
-    mcp.run()
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
