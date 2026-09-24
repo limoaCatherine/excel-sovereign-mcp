@@ -1,0 +1,15 @@
+[project]
+name = "excel-sovereign-mcp"
+version = "1.0.0"
+description = "Local Excel MCP. The server chooses openpyxl or Excel COM, then screenshots the write."
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.2", "openpyxl>=3.1"]
+
+[project.scripts]
+excel-sovereign-mcp = "excel_sovereign.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

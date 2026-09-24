@@ -1,0 +1,1248 @@
+using System.Collections.Concurrent;
+using System.IO.Pipes;
+using System.Runtime.InteropServices;
+using System.Text.Json;
+using Sbroenne.ExcelMcp.ComInterop.Session;
+using Sbroenne.ExcelMcp.Core.Commands;
+using Sbroenne.ExcelMcp.Core.Commands.Analysis;
+using Sbroenne.ExcelMcp.Core.Commands.Calculation;
+using Sbroenne.ExcelMcp.Core.Commands.Chart;
+using Sbroenne.ExcelMcp.Core.Commands.Diag;
+using Sbroenne.ExcelMcp.Core.Commands.Drawing;
+using Sbroenne.ExcelMcp.Core.Commands.PivotTable;
+using Sbroenne.ExcelMcp.Core.Commands.PythonInExcel;
+using Sbroenne.ExcelMcp.Core.Commands.Range;
+using Sbroenne.ExcelMcp.Service.Rpc;
+using StreamJsonRpc;
+using Sbroenne.ExcelMcp.Core.Commands.Screenshot;
+using Sbroenne.ExcelMcp.Core.Commands.Slicer;
+using Sbroenne.ExcelMcp.Core.Commands.Table;
+using Sbroenne.ExcelMcp.Core.Commands.Window;
+using Sbroenne.ExcelMcp.Core.Commands.Workbook;
+using Sbroenne.ExcelMcp.Core.Commands.XmlMap;
+using Sbroenne.ExcelMcp.Core.Utilities;
+using Sbroenne.ExcelMcp.Generated;
+
+namespace Sbroenne.ExcelMcp.Service;
+
+/// <summary>
+/// The ExcelMCP Service. Holds SessionManager and executes Core commands.
+/// Runs in-process within the host (MCP Server or CLI), accepting commands via named pipe.
+/// The named pipe enables cross-thread communication between the host's request threads
+/// and the service's STA thread (required for COM interop).
+/// </summary>
+public sealed class ExcelMcpService : IDisposable
+{
+    private readonly SessionManager _sessionManager = new();
+    private readonly ConcurrentDictionary<string, byte> _knownSessionIds = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<Task, byte> _activeConnectionTasks = new();
+    private readonly CancellationTokenSource _shutdownCts = new();
+    private readonly DateTime _startTime = DateTime.UtcNow;
+    private string _pipeName = "";
+    private TimeSpan? _idleTimeout;
+    private DateTime _lastActivityTime = DateTime.UtcNow;
+    private bool _disposed;
+
+    // Core command instances - use concrete types per CA1859
+    private readonly RangeCommands _rangeCommands = new();
+    private readonly SheetCommands _sheetCommands = new();
+    private readonly TableCommands _tableCommands = new();
+    private readonly PowerQueryCommands _powerQueryCommands;
+    private readonly PivotTableCommands _pivotTableCommands = new();
+    private readonly SlicerCommands _slicerCommands = new();
+    private readonly ChartCommands _chartCommands = new();
+    private readonly ConnectionCommands _connectionCommands = new();
+    private readonly QueryTableCommands _queryTableCommands = new();
+    private readonly NamedRangeCommands _namedRangeCommands = new();
+    private readonly ConditionalFormattingCommands _conditionalFormatCommands = new();
+    private readonly VbaCommands _vbaCommands = new();
+    private readonly DataModelCommands _dataModelCommands = new();
+    private readonly CalculationModeCommands _calculationModeCommands = new();
+    private readonly ScreenshotCommands _screenshotCommands = new();
+    private readonly DiagCommands _diagCommands = new();
+    private readonly DrawingCommands _drawingCommands = new();
+    private readonly WindowCommands _windowCommands = new();
+    private readonly WorkbookCommands _workbookCommands = new();
+    private readonly PythonInExcelCommands _pythonInExcelCommands = new();
+    private readonly AnalysisCommands _analysisCommands = new();
+    private readonly XmlMapCommands _xmlMapCommands = new();
+    private readonly FileCommands _fileCommands = new();
+
+    public ExcelMcpService()
+    {
+        _powerQueryCommands = new PowerQueryCommands(_dataModelCommands);
+    }
+
+    public DateTime StartTime => _startTime;
+    public int SessionCount => _sessionManager.GetActiveSessions().Count;
+    public SessionManager SessionManager => _sessionManager;
+
+    /// <summary>
+    /// Runs the service in-process, listening for commands on the named pipe.
+    /// This method blocks until shutdown is requested via <see cref="RequestShutdown"/>.
+    /// </summary>
+    /// <param name="pipeName">The named pipe to listen on.</param>
+    /// <param name="idleTimeout">Optional idle timeout. Service shuts down after this duration with no active sessions. Null = no timeout.</param>
+    public async Task RunAsync(string pipeName, TimeSpan? idleTimeout = null)
+    {
+        _pipeName = pipeName;
+        _idleTimeout = idleTimeout;
+        await RunPipeServerAsync(_shutdownCts.Token);
+    }
+
+    public void RequestShutdown() => _shutdownCts.Cancel();
+
+    private void RequestShutdownAfterResponse()
+    {
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(100);
+            RequestShutdown();
+        });
+    }
+
+    // Exposed for testing — backoff parameters for pipe server accept loop error recovery
+    internal static readonly TimeSpan InitialBackoff = TimeSpan.FromMilliseconds(100);
+    internal static readonly TimeSpan MaxBackoff = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Records client activity to keep the idle timeout monitor alive.
+    /// Called by <see cref="Rpc.DaemonRpcTarget"/> on each incoming RPC call.
+    /// </summary>
+    internal void RecordActivity() => _lastActivityTime = DateTime.UtcNow;
+
+    private async Task RunPipeServerAsync(CancellationToken cancellationToken)
+    {
+        // Use a semaphore to limit concurrent connections (prevents resource exhaustion)
+        using var connectionLimit = new SemaphoreSlim(10, 10);
+
+        // Start idle timeout monitor if configured
+        if (_idleTimeout.HasValue)
+        {
+            _ = Task.Run(() => MonitorIdleTimeoutAsync(cancellationToken), cancellationToken);
+        }
+
+        var currentBackoff = InitialBackoff;
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            NamedPipeServerStream? server = null;
+            try
+            {
+                server = ServiceSecurity.CreateSecureServer(_pipeName);
+                await server.WaitForConnectionAsync(cancellationToken);
+
+                // Success — reset backoff
+                currentBackoff = InitialBackoff;
+
+                // Record activity on each connection
+                _lastActivityTime = DateTime.UtcNow;
+
+                // Capture server for the task
+                var clientServer = server;
+                server = null; // Prevent disposal in finally - task owns it now
+
+                var connectionTask = Task.Run(async () =>
+                {
+                    await connectionLimit.WaitAsync();
+                    try
+                    {
+                        var rpcTarget = new DaemonRpcTarget(this);
+                        using var rpc = JsonRpc.Attach(clientServer, rpcTarget);
+                        await rpc.Completion; // Waits until client disconnects
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"RPC connection failed: {ex.Message}");
+                    }
+                    catch (OperationCanceledException ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"RPC connection cancelled: {ex.Message}");
+                    }
+                    finally
+                    {
+                        connectionLimit.Release();
+                        try { if (clientServer.IsConnected) clientServer.Disconnect(); }
+                        catch (Exception ex)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"Pipe disconnect cleanup failed: {ex.Message}");
+                        }
+
+                        try { await clientServer.DisposeAsync(); }
+                        catch (Exception ex)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"Pipe disposal cleanup failed: {ex.Message}");
+                        }
+                    }
+                });
+                _activeConnectionTasks.TryAdd(connectionTask, 0);
+                _ = connectionTask.ContinueWith(
+                    completed => _activeConnectionTasks.TryRemove(completed, out _),
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception)
+            {
+                // Backoff to prevent CPU spin when errors repeat (e.g. pipe creation failure).
+                // Doubles each iteration: 100ms → 200ms → 400ms → … → 5s cap.
+                // Resets to 100ms on next successful connection.
+                try { await Task.Delay(currentBackoff, cancellationToken); } catch (OperationCanceledException) { break; }
+                currentBackoff = TimeSpan.FromMilliseconds(Math.Min(currentBackoff.TotalMilliseconds * 2, MaxBackoff.TotalMilliseconds));
+            }
+            finally
+            {
+                if (server != null)
+                {
+                    try { if (server.IsConnected) server.Disconnect(); } catch (Exception) { /* Cleanup — disconnect may fail if client already disconnected */ }
+                    await server.DisposeAsync();
+                }
+            }
+        }
+
+        if (!_activeConnectionTasks.IsEmpty)
+        {
+            await Task.WhenAll(_activeConnectionTasks.Keys.Select(ObserveConnectionTaskAsync));
+        }
+    }
+
+    private static async Task ObserveConnectionTaskAsync(Task connectionTask)
+    {
+        try
+        {
+            await connectionTask;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            System.Diagnostics.Debug.WriteLine($"RPC connection drain failed: {ex.Message}");
+        }
+        catch (OperationCanceledException ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"RPC connection drain cancelled: {ex.Message}");
+        }
+    }
+
+    private async Task MonitorIdleTimeoutAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+
+            var hasSessions = _sessionManager.GetActiveSessions().Count > 0;
+            if (hasSessions)
+            {
+                _lastActivityTime = DateTime.UtcNow;
+                continue;
+            }
+
+            var idleTime = DateTime.UtcNow - _lastActivityTime;
+            if (idleTime >= _idleTimeout!.Value)
+            {
+                RequestShutdown();
+                break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Processes a service request directly (in-process, no pipe).
+    /// Used by the MCP Server for direct in-process communication.
+    /// </summary>
+    public async Task<ServiceResponse> ProcessAsync(ServiceRequest request)
+    {
+        try
+        {
+            // Route command
+            var parts = request.Command.Split('.', 2);
+            var category = parts[0];
+            var action = parts.Length > 1 ? parts[1] : "";
+
+            ServiceRegistry.ValidateCommandArguments(request.Command, request.Args);
+
+            ServiceResponse response = category switch
+            {
+                "service" => HandleServiceCommand(action),
+                "session" => HandleSessionCommand(action, request),
+                "sheet" or "sheetstyle" => await DispatchSheetAsync(action, request),
+                "range" or "rangeedit" or "rangeformat" or "rangelink" => await DispatchRangeAsync(action, request),
+                "table" or "tablecolumn" => await DispatchTableAsync(action, request),
+                "powerquery" => await DispatchSimpleAsync<PowerQueryAction>(action, request,
+                    ServiceRegistry.PowerQuery.TryParseAction,
+                    (a, batch) => ServiceRegistry.PowerQuery.DispatchToCore(_powerQueryCommands, a, batch, request.Args)),
+                "pivottable" => await DispatchSimpleAsync<PivotTableAction>(action, request,
+                    ServiceRegistry.PivotTable.TryParseAction,
+                    (a, batch) => ServiceRegistry.PivotTable.DispatchToCore(_pivotTableCommands, a, batch, request.Args)),
+                "pivottablefield" => await DispatchSimpleAsync<PivotTableFieldAction>(action, request,
+                    ServiceRegistry.PivotTableField.TryParseAction,
+                    (a, batch) => ServiceRegistry.PivotTableField.DispatchToCore(_pivotTableCommands, a, batch, request.Args)),
+                "pivottablecalc" => await DispatchSimpleAsync<PivotTableCalcAction>(action, request,
+                    ServiceRegistry.PivotTableCalc.TryParseAction,
+                    (a, batch) => ServiceRegistry.PivotTableCalc.DispatchToCore(_pivotTableCommands, a, batch, request.Args)),
+                "chart" => await DispatchSimpleAsync<ChartAction>(action, request,
+                    ServiceRegistry.Chart.TryParseAction,
+                    (a, batch) => ServiceRegistry.Chart.DispatchToCore(_chartCommands, a, batch, request.Args)),
+                "chartconfig" => await DispatchSimpleAsync<ChartConfigAction>(action, request,
+                    ServiceRegistry.ChartConfig.TryParseAction,
+                    (a, batch) => ServiceRegistry.ChartConfig.DispatchToCore(_chartCommands, a, batch, request.Args)),
+                "connection" => await DispatchSimpleAsync<ConnectionAction>(action, request,
+                    ServiceRegistry.Connection.TryParseAction,
+                    (a, batch) => ServiceRegistry.Connection.DispatchToCore(_connectionCommands, a, batch, request.Args)),
+                "querytable" => await DispatchSimpleAsync<QueryTableAction>(action, request,
+                    ServiceRegistry.QueryTable.TryParseAction,
+                    (a, batch) => ServiceRegistry.QueryTable.DispatchToCore(_queryTableCommands, a, batch, request.Args)),
+                "calculation" => await DispatchSimpleAsync<CalculationAction>(action, request,
+                    ServiceRegistry.Calculation.TryParseAction,
+                    (a, batch) => ServiceRegistry.Calculation.DispatchToCore(_calculationModeCommands, a, batch, request.Args)),
+                "analysis" => await DispatchSimpleAsync<AnalysisAction>(action, request,
+                    ServiceRegistry.Analysis.TryParseAction,
+                    (a, batch) => ServiceRegistry.Analysis.DispatchToCore(_analysisCommands, a, batch, request.Args)),
+                "namedrange" => await DispatchSimpleAsync<NamedRangeAction>(action, request,
+                    ServiceRegistry.NamedRange.TryParseAction,
+                    (a, batch) => ServiceRegistry.NamedRange.DispatchToCore(_namedRangeCommands, a, batch, request.Args)),
+                "conditionalformat" => await DispatchSimpleAsync<ConditionalFormatAction>(action, request,
+                    ServiceRegistry.ConditionalFormat.TryParseAction,
+                    (a, batch) => ServiceRegistry.ConditionalFormat.DispatchToCore(_conditionalFormatCommands, a, batch, request.Args)),
+                "vba" => await DispatchSimpleAsync<VbaAction>(action, request,
+                    ServiceRegistry.Vba.TryParseAction,
+                    (a, batch) => ServiceRegistry.Vba.DispatchToCore(_vbaCommands, a, batch, request.Args)),
+                "datamodel" => await DispatchSimpleAsync<DataModelAction>(action, request,
+                    ServiceRegistry.DataModel.TryParseAction,
+                    (a, batch) => ServiceRegistry.DataModel.DispatchToCore(_dataModelCommands, a, batch, request.Args)),
+                "datamodelrel" => await DispatchSimpleAsync<DataModelRelAction>(action, request,
+                    ServiceRegistry.DataModelRel.TryParseAction,
+                    (a, batch) => ServiceRegistry.DataModelRel.DispatchToCore(_dataModelCommands, a, batch, request.Args)),
+                "slicer" => await DispatchSimpleAsync<SlicerAction>(action, request,
+                    ServiceRegistry.Slicer.TryParseAction,
+                    (a, batch) => ServiceRegistry.Slicer.DispatchToCore(_slicerCommands, a, batch, request.Args)),
+                "screenshot" => await DispatchSimpleAsync<ScreenshotAction>(action, request,
+                    ServiceRegistry.Screenshot.TryParseAction,
+                    (a, batch) => ServiceRegistry.Screenshot.DispatchToCore(_screenshotCommands, a, batch, request.Args)),
+                "window" => await DispatchWindowAsync(action, request),
+                "workbook" => await DispatchWorkbookAsync(action, request),
+                "diag" => DispatchSessionless(action, request),
+                "drawing" => await DispatchSimpleAsync<DrawingAction>(action, request,
+                    ServiceRegistry.Drawing.TryParseAction,
+                    (a, batch) => ServiceRegistry.Drawing.DispatchToCore(_drawingCommands, a, batch, request.Args)),
+                "pythoninexcel" => await DispatchSimpleAsync<PythonInExcelAction>(action, request,
+                    ServiceRegistry.PythonInExcel.TryParseAction,
+                    (a, batch) => ServiceRegistry.PythonInExcel.DispatchToCore(_pythonInExcelCommands, a, batch, request.Args)),
+                "xmlmap" => await DispatchSimpleAsync<XmlMapAction>(action, request,
+                    ServiceRegistry.XmlMap.TryParseAction,
+                    (a, batch) => ServiceRegistry.XmlMap.DispatchToCore(_xmlMapCommands, a, batch, request.Args)),
+                _ => new ServiceResponse
+                {
+                    Success = false,
+                    ErrorCategory = "InvalidInput",
+                    ErrorMessage = $"Unknown command category: {category}"
+                }
+            };
+
+            return AttachRequestContext(request, response);
+        }
+        catch (Exception ex)
+        {
+            // Include type name so callers can distinguish exception kinds (GitHub #482, Bug 5)
+            return CreateErrorResponse(ex, request.Command, request.SessionId);
+        }
+    }
+
+    // === SERVICE COMMANDS ===
+
+    private ServiceResponse HandleServiceCommand(string action)
+    {
+        return action switch
+        {
+            "ping" => new ServiceResponse { Success = true },
+            "shutdown" => HandleShutdown(),
+            "status" => HandleStatus(),
+            _ => new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = $"Unknown service action: {action}"
+            }
+        };
+    }
+
+    private ServiceResponse HandleShutdown()
+    {
+        RequestShutdownAfterResponse();
+        return new ServiceResponse { Success = true };
+    }
+
+    private ServiceResponse HandleStatus()
+    {
+        var status = new ServiceStatus
+        {
+            Running = true,
+            ProcessId = Environment.ProcessId,
+            SessionCount = _sessionManager.GetActiveSessions().Count,
+            StartTime = _startTime
+        };
+        return new ServiceResponse { Success = true, Result = JsonSerializer.Serialize(status, ServiceProtocol.JsonOptions) };
+    }
+
+    // === SESSION COMMANDS ===
+
+    private ServiceResponse HandleSessionCommand(string action, ServiceRequest request)
+    {
+        if (action is not ("create" or "open" or "close" or "list" or "test"))
+        {
+            return new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = $"Unknown session action: {action}"
+            };
+        }
+
+        ValidateSessionActionArguments(action, request.Args);
+        return action switch
+        {
+            "create" => HandleSessionCreate(request),
+            "open" => HandleSessionOpen(request),
+            "close" => HandleSessionClose(request),
+            "list" => HandleSessionList(),
+            "test" => HandleSessionTest(request),
+            _ => throw new InvalidOperationException($"Unhandled session action: {action}")
+        };
+    }
+
+    private static void ValidateSessionActionArguments(string action, string? argsJson)
+    {
+        var allowedParameters = action switch
+        {
+            "create" => new HashSet<string>(
+                ["filePath", "macroEnabled", "show", "timeoutSeconds"],
+                StringComparer.Ordinal),
+            "open" => new HashSet<string>(
+                ["filePath", "show", "timeoutSeconds", "allowMacros"],
+                StringComparer.Ordinal),
+            "close" => new HashSet<string>(["save"], StringComparer.Ordinal),
+            "test" => new HashSet<string>(["filePath"], StringComparer.Ordinal),
+            _ => []
+        };
+        var unknownParameters = ServiceRegistry.GetJsonPropertyNames(argsJson, includeNullValues: true)
+            .Where(parameter => !allowedParameters.Contains(parameter))
+            .ToArray();
+        if (unknownParameters.Length > 0)
+        {
+            throw new ArgumentException(
+                $"Unknown parameter(s) for session.{action}: {string.Join(", ", unknownParameters)}.");
+        }
+    }
+
+    private ServiceResponse HandleSessionCreate(ServiceRequest request)
+    {
+        var args = ServiceRegistry.DeserializeArgs<SessionOpenArgs>(request.Args);
+        var timeout = ParameterTransforms.ParseTimeoutSeconds(
+            args.TimeoutSeconds,
+            "timeoutSeconds",
+            minimumSeconds: 10,
+            maximumSeconds: 3600);
+        if (string.IsNullOrWhiteSpace(args?.FilePath))
+        {
+            return new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = "filePath is required"
+            };
+        }
+
+        var fullPath = FilePathValidation.NormalizeAbsoluteWindowsPath(args.FilePath);
+
+        if (File.Exists(fullPath))
+        {
+            return new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "Conflict",
+                ErrorMessage = $"File already exists: {fullPath}. Use session open to open an existing workbook."
+            };
+        }
+
+        var extension = Path.GetExtension(fullPath);
+        if (!string.Equals(extension, ".xlsx", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(extension, ".xlsm", StringComparison.OrdinalIgnoreCase))
+        {
+            return new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = $"Invalid file extension '{extension}'. session create supports .xlsx and .xlsm only."
+            };
+        }
+        var extensionIsMacroEnabled = string.Equals(extension, ".xlsm", StringComparison.OrdinalIgnoreCase);
+        if (args.MacroEnabled.HasValue && args.MacroEnabled.Value != extensionIsMacroEnabled)
+        {
+            throw new ArgumentException(
+                $"macroEnabled must be {extensionIsMacroEnabled.ToString().ToLowerInvariant()} for a '{extension}' workbook.");
+        }
+
+        try
+        {
+            // Use the combined create+open which starts Excel only once
+            var sessionId = _sessionManager.CreateSessionForNewFile(fullPath, show: args.Show, operationTimeout: timeout, origin: SessionOrigin.CLI);
+            _knownSessionIds.TryAdd(sessionId, 0);
+
+            return new ServiceResponse
+            {
+                Success = true,
+                Result = JsonSerializer.Serialize(new { success = true, sessionId, filePath = fullPath }, ServiceProtocol.JsonOptions)
+            };
+        }
+        catch (Exception ex)
+        {
+            return CreateErrorResponse(ex);
+        }
+    }
+
+    private ServiceResponse HandleSessionOpen(ServiceRequest request)
+    {
+        var args = ServiceRegistry.DeserializeArgs<SessionOpenArgs>(request.Args);
+        var timeout = ParameterTransforms.ParseTimeoutSeconds(
+            args.TimeoutSeconds,
+            "timeoutSeconds",
+            minimumSeconds: 10,
+            maximumSeconds: 3600);
+        if (string.IsNullOrWhiteSpace(args?.FilePath))
+        {
+            return new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = "filePath is required"
+            };
+        }
+        var fullPath = FilePathValidation.NormalizeAbsoluteWindowsPath(args.FilePath);
+
+        try
+        {
+            var sessionId = _sessionManager.CreateSession(fullPath, show: args.Show, operationTimeout: timeout, origin: SessionOrigin.CLI, allowMacros: args.AllowMacros);
+            _knownSessionIds.TryAdd(sessionId, 0);
+            return new ServiceResponse
+            {
+                Success = true,
+                Result = JsonSerializer.Serialize(new { success = true, sessionId, filePath = fullPath }, ServiceProtocol.JsonOptions)
+            };
+        }
+        catch (Exception ex)
+        {
+            return CreateErrorResponse(ex);
+        }
+    }
+
+    private ServiceResponse HandleSessionClose(ServiceRequest request)
+    {
+        var args = ServiceRegistry.DeserializeArgs<SessionCloseArgs>(request.Args);
+        var shouldSave = args?.Save ?? false;
+
+        if (string.IsNullOrWhiteSpace(request.SessionId))
+        {
+            return new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = "sessionId is required"
+            };
+        }
+
+        bool closed;
+        try
+        {
+            closed = _sessionManager.CloseSession(request.SessionId, save: shouldSave);
+        }
+        catch (Exception ex) when (IsFatalExcelDisconnect(ex))
+        {
+            CleanupDeadSession(request.SessionId);
+            return CreateExcelDisconnectedResponse(request.SessionId, ex, shouldSave
+                ? "Excel disconnected while saving before close. Session has been cleaned up; reopen the workbook and verify whether the save completed."
+                : "Excel disconnected while closing. Session has been cleaned up; reopen the workbook with a new session.");
+        }
+
+        if (closed)
+        {
+            return new ServiceResponse { Success = true };
+        }
+
+        if (_knownSessionIds.ContainsKey(request.SessionId))
+        {
+            return new ServiceResponse
+            {
+                Success = true,
+                Result = JsonSerializer.Serialize(
+                    new { success = true, sessionId = request.SessionId, message = "Session already closed." },
+                    ServiceProtocol.JsonOptions)
+            };
+        }
+
+        return new ServiceResponse
+        {
+            Success = false,
+            ErrorCategory = "SessionNotFound",
+            ErrorMessage = $"Session '{request.SessionId}' not found"
+        };
+    }
+
+    private ServiceResponse HandleSessionTest(ServiceRequest request)
+    {
+        var args = ServiceRegistry.DeserializeArgs<SessionTestArgs>(request.Args);
+        if (string.IsNullOrWhiteSpace(args.FilePath))
+        {
+            return new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = "filePath is required"
+            };
+        }
+
+        try
+        {
+            var result = _fileCommands.Test(args.FilePath);
+            return new ServiceResponse
+            {
+                Success = true,
+                Result = JsonSerializer.Serialize(result, ServiceProtocol.JsonOptions)
+            };
+        }
+        catch (Exception ex)
+        {
+            return CreateErrorResponse(ex);
+        }
+    }
+
+    private ServiceResponse HandleSessionList()
+    {
+        var sessions = _sessionManager.GetActiveSessions()
+            .Select(s => new
+            {
+                sessionId = s.SessionId,
+                filePath = s.FilePath,
+                isExcelVisible = _sessionManager.IsExcelVisible(s.SessionId),
+                activeOperations = _sessionManager.GetActiveOperationCount(s.SessionId),
+                canClose = _sessionManager.GetActiveOperationCount(s.SessionId) == 0
+            })
+            .ToList();
+
+        return new ServiceResponse
+        {
+            Success = true,
+            Result = JsonSerializer.Serialize(new { success = true, sessions, count = sessions.Count }, ServiceProtocol.JsonOptions)
+        };
+    }
+
+
+
+    // === GENERATED DISPATCH ===
+
+    // All command routing uses ServiceRegistry.*.DispatchToCore() generated methods.
+
+    // See ServiceRegistry.*.Dispatch.g.cs for the generated code.
+
+
+
+    private delegate bool TryParseDelegate<TAction>(string action, out TAction result);
+
+
+
+    private static ServiceResponse WrapResult(string? dispatchResult)
+
+    {
+
+        return dispatchResult == null
+
+            ? new ServiceResponse { Success = true }
+
+            : new ServiceResponse { Success = true, Result = dispatchResult };
+
+    }
+
+
+
+    private async Task<ServiceResponse> DispatchSimpleAsync<TAction>(
+
+        string actionString, ServiceRequest request,
+
+        TryParseDelegate<TAction> tryParse,
+
+        Func<TAction, IExcelBatch, string?> dispatch) where TAction : struct
+
+    {
+
+        if (!tryParse(actionString, out var action))
+
+            return new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = $"Unknown action: {actionString}"
+            };
+
+
+
+        return await WithSessionAsync(request.SessionId, batch => WrapResult(dispatch(action, batch)));
+
+    }
+
+    /// <summary>
+    /// Dispatches a session-less command (no Excel batch required).
+    /// Used for [NoSession] categories like diag.
+    /// </summary>
+    private ServiceResponse DispatchSessionless(string actionString, ServiceRequest request)
+    {
+        if (!ServiceRegistry.Diag.TryParseAction(actionString, out var action))
+            return new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = $"Unknown action: {actionString}"
+            };
+
+        return WrapResult(ServiceRegistry.Diag.DispatchToCore(_diagCommands, action, request.Args));
+    }
+
+    private async Task<ServiceResponse> DispatchSheetAsync(string actionString, ServiceRequest request)
+
+    {
+
+        if (ServiceRegistry.Sheet.TryParseAction(actionString, out var sheetAction))
+
+        {
+
+            // CopyToFile/MoveToFile are atomic operations without session
+
+            if (sheetAction is SheetAction.CopyToFile or SheetAction.MoveToFile)
+
+            {
+
+                try
+
+                {
+
+                    return WrapResult(ServiceRegistry.Sheet.DispatchToCore(
+
+                        _sheetCommands, sheetAction, null!, request.Args));
+
+                }
+
+                catch (Exception ex)
+
+                {
+
+                    return CreateErrorResponse(ex);
+
+                }
+
+            }
+
+
+
+            return await WithSessionAsync(request.SessionId, batch =>
+
+                WrapResult(ServiceRegistry.Sheet.DispatchToCore(_sheetCommands, sheetAction, batch, request.Args)));
+
+        }
+
+
+
+        if (ServiceRegistry.SheetStyle.TryParseAction(actionString, out var styleAction))
+
+        {
+
+            return await WithSessionAsync(request.SessionId, batch =>
+
+                WrapResult(ServiceRegistry.SheetStyle.DispatchToCore(_sheetCommands, styleAction, batch, request.Args)));
+
+        }
+
+
+
+        return new ServiceResponse
+        {
+            Success = false,
+            ErrorCategory = "InvalidInput",
+            ErrorMessage = $"Unknown sheet action: {actionString}"
+        };
+
+    }
+
+
+
+    private async Task<ServiceResponse> DispatchRangeAsync(string actionString, ServiceRequest request)
+    {
+        return await WithSessionAsync(request.SessionId, batch =>
+        {
+            if (ServiceRegistry.Range.TryParseAction(actionString, out var ra))
+                return WrapResult(ServiceRegistry.Range.DispatchToCore(_rangeCommands, ra, batch, request.Args));
+
+            if (ServiceRegistry.RangeEdit.TryParseAction(actionString, out var rea))
+                return WrapResult(ServiceRegistry.RangeEdit.DispatchToCore(_rangeCommands, rea, batch, request.Args));
+
+            if (ServiceRegistry.RangeFormat.TryParseAction(actionString, out var rfa))
+                return WrapResult(ServiceRegistry.RangeFormat.DispatchToCore(_rangeCommands, rfa, batch, request.Args));
+
+            if (ServiceRegistry.RangeLink.TryParseAction(actionString, out var rla))
+                return WrapResult(ServiceRegistry.RangeLink.DispatchToCore(_rangeCommands, rla, batch, request.Args));
+
+            return new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = $"Unknown range action: {actionString}"
+            };
+        });
+    }
+
+
+    private async Task<ServiceResponse> DispatchTableAsync(string actionString, ServiceRequest request)
+
+    {
+
+        return await WithSessionAsync(request.SessionId, batch =>
+
+        {
+
+            if (ServiceRegistry.Table.TryParseAction(actionString, out var ta))
+
+                return WrapResult(ServiceRegistry.Table.DispatchToCore(_tableCommands, ta, batch, request.Args));
+
+            if (ServiceRegistry.TableColumn.TryParseAction(actionString, out var tca))
+
+                return WrapResult(ServiceRegistry.TableColumn.DispatchToCore(_tableCommands, tca, batch, request.Args));
+
+            return new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = $"Unknown table action: {actionString}"
+            };
+
+        });
+
+    }
+
+    private async Task<ServiceResponse> DispatchWindowAsync(string actionString, ServiceRequest request)
+    {
+        if (!ServiceRegistry.Window.TryParseAction(actionString, out var windowAction))
+            return new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = $"Unknown window action: {actionString}"
+            };
+
+        return await WithSessionAsync(request.SessionId, batch =>
+        {
+            var result = WrapResult(ServiceRegistry.Window.DispatchToCore(_windowCommands, windowAction, batch, request.Args));
+
+            // Update SessionManager visibility flag when show/hide commands succeed
+            if (result.Success && !string.IsNullOrWhiteSpace(request.SessionId))
+            {
+                if (windowAction is WindowAction.Show or WindowAction.Arrange or WindowAction.SetState or WindowAction.SetPosition)
+                {
+                    _sessionManager.SetExcelVisible(request.SessionId, true);
+                }
+
+                else if (windowAction is WindowAction.Hide)
+                {
+                    _sessionManager.SetExcelVisible(request.SessionId, false);
+                }
+            }
+
+            return result;
+        });
+    }
+
+    private async Task<ServiceResponse> DispatchWorkbookAsync(string actionString, ServiceRequest request)
+    {
+        if (!ServiceRegistry.Workbook.TryParseAction(actionString, out var workbookAction))
+        {
+            return new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = $"Unknown workbook action: {actionString}"
+            };
+        }
+
+        return await WithSessionAsync(request.SessionId, batch =>
+        {
+            string? reservedPath = null;
+            var releaseReservation = true;
+            if (workbookAction == WorkbookAction.SaveAs &&
+                !string.IsNullOrWhiteSpace(request.SessionId))
+            {
+                reservedPath = _sessionManager.ReserveSessionFilePath(
+                    request.SessionId,
+                    GetRequiredStringArgument(request.Args, "targetPath"));
+            }
+
+            try
+            {
+                var result = WrapResult(
+                    ServiceRegistry.Workbook.DispatchToCore(_workbookCommands, workbookAction, batch, request.Args));
+
+                if (result.Success && reservedPath != null)
+                {
+                    _sessionManager.UpdateSessionFilePath(request.SessionId!, batch.WorkbookPath);
+                }
+
+                return result;
+            }
+            catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
+            {
+                // The COM call may still be mutating the target. WithSessionAsync force-closes
+                // the session, whose cleanup releases every path claim after Excel terminates.
+                releaseReservation = false;
+                throw;
+            }
+            finally
+            {
+                if (reservedPath != null && releaseReservation)
+                {
+                    _sessionManager.ReleaseSessionFilePathReservation(request.SessionId!, reservedPath);
+                }
+            }
+        });
+    }
+
+    private static string GetRequiredStringArgument(string? args, string argumentName)
+    {
+        if (string.IsNullOrWhiteSpace(args))
+        {
+            throw new ArgumentException($"{argumentName} is required.", argumentName);
+        }
+
+        using var document = JsonDocument.Parse(args);
+        foreach (var property in document.RootElement.EnumerateObject())
+        {
+            if (string.Equals(property.Name, argumentName, StringComparison.OrdinalIgnoreCase) &&
+                property.Value.ValueKind == JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(property.Value.GetString()))
+            {
+                return property.Value.GetString()!;
+            }
+        }
+
+        throw new ArgumentException($"{argumentName} is required.", argumentName);
+    }
+
+
+    private Task<ServiceResponse> WithSessionAsync(string? sessionId, Func<IExcelBatch, ServiceResponse> action)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId))
+        {
+            return Task.FromResult(new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = "sessionId is required"
+            });
+        }
+
+        var sessionError = TryBeginUsableSession(sessionId, out var batch);
+        if (sessionError != null)
+        {
+            return Task.FromResult(sessionError);
+        }
+
+        try
+        {
+            var response = action(batch!);
+            return Task.FromResult(response);
+        }
+        catch (TimeoutException ex)
+        {
+            // Operation timed out — Excel COM call is hung (IDispatch.Invoke stuck).
+            // Force-close the session to trigger the force-kill path in ExcelBatch.Dispose(),
+            // which will kill the hung Excel process and release the STA thread.
+            try
+            {
+                _sessionManager.CloseSession(sessionId, save: false, force: true);
+            }
+            catch (Exception cleanupEx)
+            {
+                System.Diagnostics.Debug.WriteLine($"Session cleanup failed for {sessionId}: {cleanupEx.Message}");
+            }
+            return Task.FromResult(new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "Timeout",
+                ErrorMessage = $"Excel operation timed out and the session has been closed: {ex.Message} " +
+                               "Please reopen the file with a new session.",
+                ExceptionType = ex.GetType().Name
+            });
+        }
+        catch (OperationCanceledException)
+        {
+            // Caller cancelled (e.g., VS Code cancelled the tool call) while a COM operation
+            // may still be running on the STA thread. ExcelBatch.Execute sets _operationTimedOut
+            // on cancellation, but nobody calls Dispose() — the session stays alive with a
+            // stuck STA thread, and all subsequent requests queue up and hang.
+            // Force-close the session to kill the hung Excel process and release the STA thread.
+            try
+            {
+                _sessionManager.CloseSession(sessionId, save: false, force: true);
+            }
+            catch (Exception cleanupEx)
+            {
+                System.Diagnostics.Debug.WriteLine($"Session cleanup failed for {sessionId}: {cleanupEx.Message}");
+            }
+            return Task.FromResult(new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "Cancelled",
+                ErrorMessage = $"Operation was cancelled and the session has been closed. " +
+                               "The Excel COM thread may have been unresponsive. " +
+                               "Please reopen the file with a new session.",
+                ExceptionType = nameof(OperationCanceledException)
+            });
+        }
+        catch (COMException ex) when (
+            ex.HResult == ResiliencePipelines.RPC_S_SERVER_UNAVAILABLE ||
+            ex.HResult == ResiliencePipelines.RPC_E_CALL_FAILED ||
+            ex.HResult == ResiliencePipelines.RPC_E_DISCONNECTED)
+        {
+            // Excel process died during the operation — clean up the dead session
+            CleanupDeadSession(sessionId);
+            return Task.FromResult(new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "ExcelProcessDied",
+                ErrorMessage = $"Excel process for session '{sessionId}' has died (the application may have been closed or crashed). " +
+                               "Session has been cleaned up. Please reopen the file with a new session.",
+                ExceptionType = ex.GetType().Name,
+                HResult = $"0x{ex.HResult:X8}"
+            });
+        }
+        catch (InvalidOperationException ex) when (
+            ex.Message.Contains("no longer running", StringComparison.OrdinalIgnoreCase) ||
+            ex.Message.Contains("process", StringComparison.OrdinalIgnoreCase))
+        {
+            // Excel process detected as dead before COM call (ExcelBatch pre-check)
+            CleanupDeadSession(sessionId);
+            return Task.FromResult(new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = "ExcelProcessDied",
+                ErrorMessage = $"Excel process for session '{sessionId}' is no longer running. " +
+                               "Session has been cleaned up. Please reopen the file with a new session.",
+                ExceptionType = ex.GetType().Name
+            });
+        }
+        catch (Exception ex)
+        {
+            if (IsFatalExcelDisconnect(ex))
+            {
+                CleanupDeadSession(sessionId);
+                return Task.FromResult(CreateExcelDisconnectedResponse(sessionId, ex,
+                    $"Excel process for session '{sessionId}' disconnected during the operation. Session has been cleaned up. Please reopen the file with a new session."));
+            }
+
+            // Check if Excel died with a non-COM exception — clean up dead session
+            if (batch != null && !batch.IsExcelProcessAlive())
+            {
+                CleanupDeadSession(sessionId);
+            }
+
+            return Task.FromResult(CreateErrorResponse(ex));
+        }
+        finally
+        {
+            _sessionManager.EndOperation(sessionId);
+        }
+    }
+
+    private void CleanupDeadSession(string sessionId)
+    {
+        try
+        {
+            _sessionManager.CloseSession(sessionId, save: false, force: true);
+        }
+        catch (Exception cleanupEx)
+        {
+            System.Diagnostics.Debug.WriteLine($"Session cleanup failed for {sessionId}: {cleanupEx.Message}");
+        }
+    }
+
+    private static ServiceResponse CreateExcelDisconnectedResponse(string sessionId, Exception ex, string message)
+    {
+        return new ServiceResponse
+        {
+            Success = false,
+            SessionId = sessionId,
+            ErrorCategory = "ExcelProcessDied",
+            ErrorMessage = message,
+            ExceptionType = ex.GetType().Name,
+            HResult = TryGetFatalComHResult(ex) is { } hresult ? $"0x{hresult:X8}" : null,
+            InnerError = ex.InnerException?.Message
+        };
+    }
+
+    private static bool IsFatalExcelDisconnect(Exception ex) => TryGetFatalComHResult(ex).HasValue;
+
+    private static int? TryGetFatalComHResult(Exception ex)
+    {
+        for (var current = ex; current != null; current = current.InnerException!)
+        {
+            if (current is COMException comEx &&
+                (IsFatalComHResult(comEx.HResult) || IsFatalComHResult(comEx.ErrorCode)))
+            {
+                return IsFatalComHResult(comEx.HResult) ? comEx.HResult : comEx.ErrorCode;
+            }
+
+            if (current.Message.Contains("disconnected", StringComparison.OrdinalIgnoreCase))
+            {
+                return ResiliencePipelines.RPC_E_DISCONNECTED;
+            }
+
+            if (current.Message.Contains("RPC server is unavailable", StringComparison.OrdinalIgnoreCase))
+            {
+                return ResiliencePipelines.RPC_S_SERVER_UNAVAILABLE;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsFatalComHResult(int hresult) =>
+        hresult == ResiliencePipelines.RPC_S_SERVER_UNAVAILABLE ||
+        hresult == ResiliencePipelines.RPC_E_CALL_FAILED ||
+        hresult == ResiliencePipelines.RPC_E_DISCONNECTED;
+
+    private static ServiceResponse AttachRequestContext(ServiceRequest request, ServiceResponse response)
+    {
+        if (response.Success)
+        {
+            return response;
+        }
+
+        var command = response.Command ?? request.Command;
+        var sessionId = response.SessionId ?? request.SessionId;
+
+        if (string.Equals(command, response.Command, StringComparison.Ordinal)
+            && string.Equals(sessionId, response.SessionId, StringComparison.Ordinal))
+        {
+            return response;
+        }
+
+        return CloneResponse(response, command, sessionId);
+    }
+
+    private static ServiceResponse CloneResponse(ServiceResponse response, string? command, string? sessionId)
+    {
+        return new ServiceResponse
+        {
+            Success = response.Success,
+            Command = command,
+            SessionId = sessionId,
+            ErrorMessage = response.ErrorMessage,
+            ErrorCategory = response.ErrorCategory,
+            ExceptionType = response.ExceptionType,
+            HResult = response.HResult,
+            InnerError = response.InnerError,
+            Result = response.Result
+        };
+    }
+
+    private static ServiceResponse CreateErrorResponse(Exception ex, string? command = null, string? sessionId = null)
+    {
+        var exceptionType = ex.GetType().Name;
+        string? hresult = OperationFailureClassifier.GetComHResult(ex);
+        string? innerError = null;
+        var errorCategory = OperationFailureClassifier.Classify(ex);
+
+        if (ex.InnerException != null)
+        {
+            innerError = ex.InnerException.Message;
+            if (ex.InnerException is COMException innerComEx)
+            {
+                innerError += $" [COM: 0x{innerComEx.HResult:X8}]";
+            }
+        }
+
+        return ex switch
+        {
+            PowerQueryCommandException pqEx => new ServiceResponse
+            {
+                Success = false,
+                Command = command,
+                SessionId = sessionId,
+                ErrorCategory = pqEx.ErrorCategory,
+                ErrorMessage = $"{pqEx.GetType().Name}: {pqEx.Message}",
+                ExceptionType = exceptionType,
+                HResult = hresult,
+                InnerError = innerError
+            },
+            _ => new ServiceResponse
+            {
+                Success = false,
+                Command = command,
+                SessionId = sessionId,
+                ErrorCategory = errorCategory,
+                ErrorMessage = $"{exceptionType}: {ex.Message}",
+                ExceptionType = exceptionType,
+                HResult = hresult,
+                InnerError = innerError
+            }
+        };
+    }
+
+    private ServiceResponse? TryBeginUsableSession(string sessionId, out IExcelBatch? batch)
+    {
+        if (!_sessionManager.TryBeginOperation(
+            sessionId,
+            out batch,
+            out var errorMessage,
+            out var sessionError))
+        {
+            return new ServiceResponse
+            {
+                Success = false,
+                ErrorCategory = sessionError switch
+                {
+                    SessionOperationError.MissingSessionId => "InvalidInput",
+                    SessionOperationError.NotFound => "SessionNotFound",
+                    SessionOperationError.Closing
+                        or SessionOperationError.Quarantined => "SessionUnavailable",
+                    SessionOperationError.TimedOutOrCancelled => "SessionInvalidated",
+                    SessionOperationError.ExcelProcessDied => "ExcelProcessDied",
+                    _ => null
+                },
+                ErrorMessage = errorMessage
+            };
+        }
+
+        return null;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        _shutdownCts.Cancel();
+        _sessionManager.Dispose();
+        _shutdownCts.Dispose();
+    }
+}
+
+// === ARGUMENT TYPES (Session only - all other args are now generated in ServiceRegistry) ===
+
+// Session
+public sealed class SessionOpenArgs
+{
+    public string? FilePath { get; set; }
+    public bool? MacroEnabled { get; set; }
+    public bool Show { get; set; }
+    public int? TimeoutSeconds { get; set; }
+    public bool AllowMacros { get; set; }
+}
+public sealed class SessionCloseArgs { public bool Save { get; set; } }
+public sealed class SessionTestArgs { public string? FilePath { get; set; } }

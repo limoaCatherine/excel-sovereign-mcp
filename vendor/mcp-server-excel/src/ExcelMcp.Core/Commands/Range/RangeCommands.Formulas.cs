@@ -1,0 +1,314 @@
+using Sbroenne.ExcelMcp.ComInterop;
+using Sbroenne.ExcelMcp.ComInterop.Session;
+using Sbroenne.ExcelMcp.Core.Models;
+using Sbroenne.ExcelMcp.Core.Utilities;
+using Excel = Microsoft.Office.Interop.Excel;
+
+
+namespace Sbroenne.ExcelMcp.Core.Commands.Range;
+
+/// <summary>
+/// Range formula operations (get/set formulas as 2D arrays)
+/// </summary>
+public partial class RangeCommands
+{
+    /// <inheritdoc />
+    public RangeFormulaResult GetFormulas(IExcelBatch batch, string sheetName, string rangeAddress)
+    {
+        var result = new RangeFormulaResult
+        {
+            FilePath = batch.WorkbookPath,
+            SheetName = sheetName,
+            RangeAddress = rangeAddress
+        };
+
+        return batch.Execute((ctx, ct) =>
+        {
+            dynamic? range = null;
+            try
+            {
+                range = RangeHelpers.ResolveRange(ctx.Book, sheetName, rangeAddress, out string? specificError);
+                if (range == null)
+                {
+                    throw new InvalidOperationException(specificError ?? RangeHelpers.GetResolveError(sheetName, rangeAddress));
+                }
+
+                // Get actual address
+                result.RangeAddress = range.Address;
+                int startRow = Convert.ToInt32(range.Row);
+                int startColumn = Convert.ToInt32(range.Column);
+
+                // Preserve dynamic arrays where supported; older Excel uses legacy semantics.
+                object formulaOrArray = ReadFormulas(ctx, (Excel.Range)range);
+                object valueOrArray = range.Value2;
+
+                if (formulaOrArray is object[,] formulas && valueOrArray is object[,] values)
+                {
+                    // Multi-cell range
+                    result.RowCount = formulas.GetLength(0);
+                    result.ColumnCount = formulas.GetLength(1);
+
+                    for (int r = 1; r <= result.RowCount; r++)
+                    {
+                        var formulaRow = new List<string>();
+                        var valueRow = new List<object?>();
+
+                        for (int c = 1; c <= result.ColumnCount; c++)
+                        {
+                            string formula = formulas[r, c]?.ToString() ?? string.Empty;
+                            object? cellValue = values[r, c];
+                            string returnedFormula = formula.StartsWith('=') ? formula : string.Empty;
+
+                            // Only return actual formulas (starting with =), not values
+                            formulaRow.Add(returnedFormula);
+                            valueRow.Add(ConvertErrorForRead(
+                                cellValue,
+                                returnedFormula,
+                                startRow + r - 1,
+                                startColumn + c - 1,
+                                result.CellErrors));
+                        }
+
+                        result.Formulas.Add(formulaRow);
+                        result.Values.Add(valueRow);
+                    }
+                }
+                else
+                {
+                    // Single cell
+                    result.RowCount = 1;
+                    result.ColumnCount = 1;
+                    string formula = formulaOrArray?.ToString() ?? string.Empty;
+                    object? cellValue = valueOrArray;
+
+                    // Only return actual formulas (starting with =), not values
+                    string returnedFormula = formula.StartsWith('=') ? formula : string.Empty;
+                    result.Formulas.Add([returnedFormula]);
+                    result.Values.Add([
+                        ConvertErrorForRead(
+                            cellValue,
+                            returnedFormula,
+                            startRow,
+                            startColumn,
+                            result.CellErrors)
+                    ]);
+                }
+
+                result.Success = true;
+                return result;
+            }
+            catch (System.Runtime.InteropServices.COMException comEx) when (comEx.HResult == unchecked((int)0x8007000E))
+            {
+                // E_OUTOFMEMORY - Excel's misleading error for sheet/range/session issues
+                throw new InvalidOperationException($"Cannot read formulas from range '{rangeAddress}' on sheet '{sheetName}': {comEx.Message}", comEx);
+            }
+            finally
+            {
+                ComUtilities.Release(ref range);
+            }
+        });
+    }
+
+    internal static object? ConvertErrorForRead(
+        object? cellValue,
+        string formula,
+        int row,
+        int column,
+        List<RangeCellError> cellErrors)
+    {
+        if (!ExcelErrorMapper.TryGet(cellValue, out int errorCode, out var error))
+        {
+            return cellValue;
+        }
+
+        return ConvertMappedErrorForRead(cellValue, formula, row, column, cellErrors, errorCode, error);
+    }
+
+    private static string ConvertMappedErrorForRead(
+        object? cellValue,
+        string formula,
+        int row,
+        int column,
+        List<RangeCellError> cellErrors,
+        int errorCode,
+        ExcelErrorMapper.ExcelErrorInfo error)
+    {
+        cellErrors.Add(new RangeCellError
+        {
+            CellAddress = $"{GetColumnLetter(column)}{row}",
+            ErrorName = error.Name,
+            Formula = string.IsNullOrEmpty(formula) ? null : formula,
+            Row = row,
+            Column = column,
+            CurrentValue = cellValue,
+            ErrorCode = errorCode,
+            ErrorMessage = $"{error.Name} - {error.Description}",
+            Suggestion = error.Suggestion
+        });
+
+        return error.Name;
+    }
+
+    /// <summary>
+    /// Converts 1-based column index to Excel column letter (1=A, 26=Z, 27=AA)
+    /// </summary>
+    private static string GetColumnLetter(int columnIndex)
+    {
+        string columnName = string.Empty;
+        while (columnIndex > 0)
+        {
+            columnIndex--;
+            columnName = Convert.ToChar('A' + (columnIndex % 26)) + columnName;
+            columnIndex /= 26;
+        }
+        return columnName;
+    }
+
+    /// <inheritdoc />
+    public OperationResult SetFormulas(IExcelBatch batch, string sheetName, string rangeAddress, List<List<string>>? formulas = null, string? formulasFile = null)
+    {
+        // Resolve formulas from inline parameter or file
+        var resolvedFormulas = ParameterTransforms.ResolveFormulasOrFile(formulas, formulasFile);
+
+        var result = new OperationResult { FilePath = batch.WorkbookPath, Action = "set-formulas" };
+
+        return batch.Execute((ctx, ct) =>
+        {
+            dynamic? range = null;
+            int originalCalculation = -1;
+            bool calculationChanged = false;
+
+            try
+            {
+                range = RangeHelpers.ResolveRange(ctx.Book, sheetName, rangeAddress, out string? specificError);
+                if (range == null)
+                {
+                    throw new InvalidOperationException(specificError ?? RangeHelpers.GetResolveError(sheetName, rangeAddress));
+                }
+
+                ValidateMergedCellsForWrite((Excel.Range)range, rangeAddress, ct);
+
+                // Calculation suppressed here (not in ExcelWriteGuard) because Data Model ops need it enabled
+                originalCalculation = (int)ctx.App.Calculation;
+                if (originalCalculation != -4135) // xlCalculationManual
+                {
+                    ctx.App.Calculation = (Excel.XlCalculation)(-4135);
+                    calculationChanged = true;
+                }
+
+                // Convert List<List<string>> to 2D array
+                // Excel COM requires 1-based arrays for multi-cell ranges
+                int rows = resolvedFormulas.Count;
+                int cols = resolvedFormulas.Count > 0 ? resolvedFormulas[0].Count : 0;
+
+                ValidateRectangularRowWidths(resolvedFormulas, Convert.ToInt32(range.Columns.Count), nameof(formulas), "Formula");
+
+                if (rows > 0 && cols > 0)
+                {
+                    // Create 1-based array for Excel COM compatibility
+                    object[,] arrayFormulas = (object[,])Array.CreateInstance(typeof(object), [rows, cols], [1, 1]);
+
+                    for (int r = 1; r <= rows; r++)
+                    {
+                        for (int c = 1; c <= cols; c++)
+                        {
+                            // Convert JsonElement to proper C# type for COM interop
+                            // MCP framework deserializes JSON to JsonElement, not primitives
+                            arrayFormulas[r, c] = RangeHelpers.ConvertToCellValue(resolvedFormulas[r - 1][c - 1]);
+                        }
+                    }
+
+                    // Select before writing: a write failure can mean invalid input or protection,
+                    // not missing API support, and must never trigger a legacy retry.
+                    if (ctx.Capabilities.SupportsFormula2)
+                    {
+                        ((Excel.Range)range).Formula2 = arrayFormulas;
+                    }
+                    else
+                    {
+                        ((Excel.Range)range).Formula = arrayFormulas;
+                    }
+                }
+
+                result.Success = true;
+                return result;
+            }
+            catch (System.Runtime.InteropServices.COMException comEx) when (comEx.HResult == unchecked((int)0x8007000E))
+            {
+                // E_OUTOFMEMORY - Excel's misleading error for sheet/range/session issues
+                throw new InvalidOperationException($"Cannot write formulas to range '{rangeAddress}' on sheet '{sheetName}': {comEx.Message}", comEx);
+            }
+            finally
+            {
+                if (calculationChanged && originalCalculation != -1)
+                {
+                    try
+                    {
+                        ctx.App.Calculation = (Excel.XlCalculation)originalCalculation;
+                    }
+                    catch (System.Runtime.InteropServices.COMException)
+                    {
+                        // Ignore errors restoring calculation mode
+                    }
+                }
+                ComUtilities.Release(ref range);
+            }
+        });
+    }
+
+    private static object ReadFormulas(ExcelContext context, Excel.Range range) =>
+        context.Capabilities.SupportsFormula2 ? range.Formula2 : range.Formula;
+
+    /// <inheritdoc />
+    public SpillAreaResult GetSpill(IExcelBatch batch, string sheetName, string rangeAddress)
+    {
+        var result = new SpillAreaResult
+        {
+            FilePath = batch.WorkbookPath,
+            Action = "get-spill"
+        };
+
+        return batch.Execute((ctx, ct) =>
+        {
+            dynamic? range = null;
+            dynamic? cell = null;
+            dynamic? spill = null;
+            try
+            {
+                range = RangeHelpers.ResolveRange(ctx.Book, sheetName, rangeAddress, out string? specificError);
+                if (range == null)
+                {
+                    throw new InvalidOperationException(specificError ?? RangeHelpers.GetResolveError(sheetName, rangeAddress));
+                }
+
+                cell = range.Cells[1, 1];
+                try
+                {
+                    result.Supported = true;
+                    result.HasSpill = (bool)cell.HasSpill;
+                    if (result.HasSpill)
+                    {
+                        spill = cell.SpillingToRange;
+                        result.Address = (string?)spill.Address[false, false];
+                    }
+
+                    result.Success = true;
+                    return result;
+                }
+                catch (System.Runtime.InteropServices.COMException)
+                {
+                    result.Supported = false;
+                    result.HasSpill = false;
+                    result.Success = true;
+                    return result;
+                }
+            }
+            finally
+            {
+                ComUtilities.Release(ref spill);
+                ComUtilities.Release(ref cell);
+                ComUtilities.Release(ref range);
+            }
+        });
+    }
+}

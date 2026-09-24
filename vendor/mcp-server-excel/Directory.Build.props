@@ -1,0 +1,90 @@
+<Project>
+
+  <PropertyGroup>
+    <!-- Common properties for all projects -->
+    <Version>2.0.8</Version>
+    <AssemblyVersion>2.0.8.0</AssemblyVersion>
+    <FileVersion>2.0.8.0</FileVersion>
+    <Authors>Stefan Broenner</Authors>
+    <Company>Open Source Developer</Company>
+    <Product>Sbroenne.ExcelMcp</Product>
+    <Copyright>Copyright © 2025 Stefan Broenner</Copyright>
+
+    <!-- Repository information. PackageProjectUrl points at the documentation site
+         so NuGet package pages link to the canonical docs, not straight to GitHub. -->
+    <PackageProjectUrl>https://excelmcpserver.dev/</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/sbroenne/mcp-server-excel</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+
+    <!-- Build settings -->
+    <!-- A stale CLI cannot stop its daemon before its normal output is replaced.
+         The cleanup script sets this to build a current client in a unique,
+         isolated tree without touching or sharing intermediate project files. -->
+    <BaseOutputPath Condition="'$(ExcelMcpCleanupRoot)' != ''">$(ExcelMcpCleanupRoot)\bin\$(MSBuildProjectName)\</BaseOutputPath>
+    <BaseIntermediateOutputPath Condition="'$(ExcelMcpCleanupRoot)' != ''">$(ExcelMcpCleanupRoot)\obj\$(MSBuildProjectName)\</BaseIntermediateOutputPath>
+    <MSBuildProjectExtensionsPath Condition="'$(ExcelMcpCleanupRoot)' != ''">$(BaseIntermediateOutputPath)</MSBuildProjectExtensionsPath>
+    <DefaultItemExcludes Condition="'$(ExcelMcpCleanupRoot)' != ''">$(DefaultItemExcludes);$(MSBuildProjectDirectory)\bin\**;$(MSBuildProjectDirectory)\obj\**</DefaultItemExcludes>
+
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>14</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningsAsErrors />
+
+    <!--
+      Suppressed warnings (cannot be fixed - see docs/DEVELOPMENT.md for details):
+      - CA1416: Windows-only APIs (this is a Windows-only COM automation project)
+      - CS8602: Dereference of possibly null reference (dynamic COM objects)
+      - SYSLIB1045: GeneratedRegexAttribute pattern (not applicable to our regex usage)
+      - IL2026: Reflection/dynamic code incompatible with trimming (Excel COM uses dynamic)
+      - IL3050: Code incompatible with Native AOT (Excel COM requires runtime COM activation)
+      - CS1573: Parameter has no matching param tag (batch parameter is internal, filtered by generators)
+      - CA1848: Use LoggerMessage delegates (perf optimization not needed for our diagnostic logging)
+      - CA1873: Logging argument evaluation (diagnostics only, performance not critical)
+      - CA1875: Regex.Count vs Regex.Matches.Count (test code readability, not perf critical)
+    -->
+    <NoWarn>$(NoWarn);CA1416;CS8602;SYSLIB1045;IL2026;IL3050;CS1573;CA1848;CA1873;CA1875</NoWarn>
+
+    <!-- Deterministic builds for reproducibility -->
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+
+    <!-- Code Analysis -->
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <AnalysisMode>Recommended</AnalysisMode>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <CodeAnalysisTreatWarningsAsErrors>true</CodeAnalysisTreatWarningsAsErrors>
+
+    <!-- Generate XML documentation for all projects to enable IDE0005 analyzer -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+
+
+    <!-- Security -->
+    <PublishTrimmed>false</PublishTrimmed>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <_SkipUpgradeNetAnalyzersNuGetWarning>true</_SkipUpgradeNetAnalyzersNuGetWarning>
+
+  </PropertyGroup>
+
+  <!--
+    Pre-build cleanup: before the CLI project replaces its output, ask the
+    current CLI cleanup implementation to stop only the daemon and Excel
+    processes tracked for the selected pipe. Restricting this target to the CLI
+    project prevents parallel solution builds from launching cleanup clients
+    that lock the CLI output.
+    Skipped in CI (no Excel/Service there).
+  -->
+  <Target Name="StopExcelMcpProcesses"
+          BeforeTargets="BeforeBuild"
+          Condition="'$(MSBuildProjectName)' == 'ExcelMcp.CLI' AND '$(CI)' != 'true' AND '$(ExcelMcpSkipCleanup)' != 'true'">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)scripts\Stop-ExcelMcpProcesses.ps1&quot;"
+          StandardOutputImportance="low" />
+  </Target>
+
+  <!-- Import user-specific properties (gitignored, for local secrets) -->
+  <Import Project="Directory.Build.props.user" Condition="Exists('Directory.Build.props.user')" />
+
+</Project>

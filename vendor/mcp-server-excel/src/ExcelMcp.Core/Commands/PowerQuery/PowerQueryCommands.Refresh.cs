@@ -1,0 +1,187 @@
+using System.Runtime.InteropServices;
+using Sbroenne.ExcelMcp.ComInterop;
+using Sbroenne.ExcelMcp.ComInterop.Session;
+using Sbroenne.ExcelMcp.Core.Models;
+using Excel = Microsoft.Office.Interop.Excel;
+
+namespace Sbroenne.ExcelMcp.Core.Commands;
+
+/// <summary>
+/// Power Query refresh operations
+/// </summary>
+public partial class PowerQueryCommands
+{
+    /// <inheritdoc />
+    public PowerQueryRefreshResult Refresh(IExcelBatch batch, string queryName, TimeSpan timeout, IProgress<ProgressInfo>? progress = null)
+    {
+        var result = new PowerQueryRefreshResult
+        {
+            FilePath = batch.WorkbookPath,
+            QueryName = queryName,
+            RefreshTime = DateTime.Now
+        };
+
+        // Validate query name
+        if (!ValidateQueryName(queryName, out string? validationError))
+        {
+            throw new ArgumentException(validationError, nameof(queryName));
+        }
+
+        if (timeout <= TimeSpan.Zero)
+        {
+            timeout = ComInteropConstants.DataOperationTimeout;
+        }
+        else if (timeout.TotalMilliseconds > uint.MaxValue - 1)
+        {
+            // TimeSpan.Parse("1800") = 1800 days — too large for CancellationTokenSource (~49.7 day max)
+            timeout = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+        }
+
+        using var timeoutCts = new CancellationTokenSource(timeout);
+        string? queryFormula = null;
+
+        try
+        {
+            return batch.Execute((ctx, ct) =>
+            {
+                Excel.WorkbookQuery? query = null;
+                try
+                {
+                    query = PowerQuery.PowerQueryHelpers.FindQueryByExactName(ctx.Book, queryName);
+                    if (query == null)
+                    {
+                        throw new InvalidOperationException($"Query '{queryName}' not found.");
+                    }
+
+                    queryFormula = query.Formula?.ToString();
+
+                    // Refresh the query - exceptions propagate from both:
+                    // - QueryTable.Refresh() for worksheet queries
+                    // - Connection.Refresh() for Data Model queries
+                    progress?.Report(new ProgressInfo { Current = 0, Total = 1, Message = $"Refreshing '{queryName}'" });
+                    bool refreshed;
+                    try
+                    {
+                        refreshed = RefreshConnectionByQueryName(ctx.Book, queryName, timeoutCts.Token);
+                    }
+                    catch (Exception ex) when (TryWrapPowerQueryException(ex, out var pqEx))
+                    {
+                        throw pqEx!;
+                    }
+
+                    if (!refreshed)
+                    {
+                        throw new InvalidOperationException($"Could not find connection or table for query '{queryName}'.");
+                    }
+
+                    result.HasErrors = false;
+                    result.Success = true;
+                    var loadState = DetectLoadState(ctx.Book, queryName, ct);
+                    result.LoadedToSheet = loadState.TargetSheet;
+                    result.IsConnectionOnly = loadState.IsConnectionOnly;
+
+                    progress?.Report(new ProgressInfo { Current = 1, Total = 1, Message = $"Refreshed '{queryName}'" });
+                    return result;
+                }
+                finally
+                {
+                    ComUtilities.Release(ref query);
+                }
+            }, timeoutCts.Token);
+        }
+        catch (TimeoutException ex) when (IsLikelyPrivacyFirewallRisk(queryFormula))
+        {
+            throw new PowerQueryCommandException(
+                $"Likely Formula.Firewall/privacy-blocked refresh for query '{queryName}'. The query combines Excel.CurrentWorkbook with an external data source and Excel may have shown a privacy/modal prompt instead of returning a normal refresh error.",
+                "Privacy",
+                ex);
+        }
+    }
+
+    /// <summary>
+    /// Refreshes all Power Query queries in the workbook
+    /// </summary>
+    /// <param name="batch">Excel batch session</param>
+    /// <param name="timeout">Maximum time to wait for all refreshes to complete</param>
+    /// <exception cref="InvalidOperationException">Thrown when refresh fails</exception>
+    public OperationResult RefreshAll(IExcelBatch batch, TimeSpan timeout = default, IProgress<ProgressInfo>? progress = null)
+    {
+        if (timeout <= TimeSpan.Zero)
+        {
+            timeout = ComInteropConstants.DataOperationTimeout;
+        }
+        else if (timeout.TotalMilliseconds > uint.MaxValue - 1)
+        {
+            // TimeSpan.Parse("1800") = 1800 days — too large for CancellationTokenSource (~49.7 day max)
+            timeout = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+        }
+
+        using var timeoutCts = new CancellationTokenSource(timeout);
+
+        return batch.Execute((ctx, ct) =>
+        {
+            Excel.Queries? queries = null;
+
+            try
+            {
+                queries = ctx.Book.Queries;
+                int totalQueries = queries.Count;
+                var errors = new List<string>();
+
+                for (int i = 1; i <= totalQueries; i++)
+                {
+                    Excel.WorkbookQuery? query = null;
+                    try
+                    {
+                        query = queries.Item(i);
+                        string queryName = query.Name;
+
+                        progress?.Report(new ProgressInfo { Current = i - 1, Total = totalQueries, Message = $"Refreshing '{queryName}' ({i}/{totalQueries})" });
+
+                        // Use the same robust strategy as single-query Refresh:
+                        // 1) QueryTable.Refresh(false) for worksheet-loaded queries
+                        // 2) Connection.Refresh() for Data Model queries
+                        bool refreshed;
+                        try
+                        {
+                            refreshed = RefreshConnectionByQueryName(ctx.Book, queryName, timeoutCts.Token);
+                        }
+                        catch (Exception ex) when (TryWrapPowerQueryException(ex, out var pqEx))
+                        {
+                            errors.Add($"{queryName} [{pqEx!.ErrorCategory}]: {pqEx.Message}");
+                            continue;
+                        }
+                        catch (COMException ex)
+                        {
+                            errors.Add($"{queryName}: {ex.Message}");
+                            continue;
+                        }
+
+                        if (!refreshed)
+                        {
+                            errors.Add($"{queryName}: Could not find connection or table for query.");
+                        }
+                    }
+                    finally
+                    {
+                        ComUtilities.Release(ref query!);
+                    }
+                }
+
+                // Throw if any errors occurred
+                if (errors.Count > 0)
+                {
+                    throw new InvalidOperationException($"Some queries failed to refresh: {string.Join(", ", errors)}");
+                }
+
+                progress?.Report(new ProgressInfo { Current = totalQueries, Total = totalQueries, Message = "All queries refreshed" });
+                return new OperationResult { Success = true, FilePath = batch.WorkbookPath };
+            }
+            finally
+            {
+                ComUtilities.Release(ref queries!);
+            }
+        }, timeoutCts.Token);
+    }
+
+}

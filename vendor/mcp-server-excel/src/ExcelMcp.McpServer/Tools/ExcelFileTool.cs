@@ -1,0 +1,368 @@
+using System.ComponentModel;
+using System.Text.Json;
+using ModelContextProtocol.Server;
+
+namespace Sbroenne.ExcelMcp.McpServer.Tools;
+
+/// <summary>
+/// Excel file management tool for MCP server.
+/// </summary>
+[McpServerToolType]
+public static partial class ExcelFileTool
+{
+    /// <summary>
+    /// File and session management for Excel automation.
+    ///
+    /// WORKFLOW: open → pass the returned ID as session_id to other tools → close (save=true to persist changes).
+    /// NEW FILES: Use 'create' action to create file AND start session in one call.
+    ///
+    /// SESSION REUSE: Call 'list' first to check for existing sessions.
+    /// If file is already open, reuse existing sessionId instead of opening again.
+    ///
+    /// IMPORTANT: Before closing, check 'list' action - wait for canClose=true (no active operations).
+    /// If show=true was used, confirm with user before closing visible Excel windows.
+    ///
+    /// TIMEOUT: Open/create default to 120 seconds. Use timeout_seconds to customize
+    /// slow workbook startup or prompt-heavy files. Operations timing out trigger
+    /// aggressive cleanup and may leave Excel in inconsistent state.
+    ///
+    /// IRM/AIP FILES: Files protected with Azure Information Protection are detected automatically.
+    /// They are opened as read-only with Excel forced visible for credential authentication.
+    /// Use 'test' first to inspect canOpen, isIrmProtected, willOpenReadOnly, and
+    /// requiresVisibleSession before attempting to open. IRM/AIP files report
+    /// canOpen=false until the required interactive Excel authentication occurs.
+    /// </summary>
+    /// <param name="action">The file operation to perform</param>
+    /// <param name="path">Full Windows path to Excel file (.xlsx or .xlsm). ASK USER for the path - do not guess or use placeholder usernames. Required for: open, create, test</param>
+    /// <param name="session_id">Session ID returned from 'open' or 'create'. Required for: close. Used by all other tools.</param>
+    /// <param name="save">Whether to save changes when closing. Default: false (discard changes)</param>
+    /// <param name="show">Whether to make Excel window visible. Default: false (hidden automation)</param>
+    /// <param name="timeout_seconds">Maximum time in seconds for opening/creating the session and for operations in this session. Default: 120. Range: 10-3600. Used for: open, create</param>
+    [McpServerTool(Name = "file", Title = "File Operations", Destructive = true)]
+    [McpMeta("category", "session")]
+    [McpMeta("requiresSession", false)]
+    public static partial string ExcelFile(
+        FileAction action,
+        [DefaultValue(null)] string? path,
+        [DefaultValue(null)] string? session_id,
+        [DefaultValue(false)] bool save,
+        [DefaultValue(false)] bool show,
+        [DefaultValue(120)] int timeout_seconds,
+        CancellationToken cancellationToken = default)
+    {
+        using var cancellationScope = ExcelToolsBase.PushCancellationToken(cancellationToken);
+
+        // Validate timeout range
+        if (timeout_seconds < 10 || timeout_seconds > 3600)
+        {
+            return JsonSerializer.Serialize(new
+            {
+                success = false,
+                errorMessage = $"timeout_seconds must be between 10 and 3600 seconds, got {timeout_seconds}",
+                errorCategory = "InvalidInput",
+                isError = true
+            }, ExcelToolsBase.JsonOptions);
+        }
+
+        var timeout = TimeSpan.FromSeconds(timeout_seconds);
+
+        return ExcelToolsBase.ExecuteToolAction(
+            "file",
+            action.ToActionString(),
+            path,
+            () =>
+            {
+                // Switch directly on enum for compile-time exhaustiveness checking (CS8524)
+                return action switch
+                {
+                    FileAction.List => ListSessions(),
+                    FileAction.Open => OpenSessionAsync(path!, show, timeout),
+                    FileAction.Close => CloseSessionAsync(session_id!, save),
+                    FileAction.Create => CreateSessionAsync(path!, show, timeout),
+                    FileAction.Test => TestFileAsync(path!),
+                    _ => throw new ArgumentException($"Unknown action: {action} ({action.ToActionString()})", nameof(action))
+                };
+            });
+    }
+
+    /// <summary>
+    /// Opens an Excel file and creates a new session via the ExcelMCP Service.
+    /// Returns sessionId that must be used for all subsequent operations.
+    /// </summary>
+    private static string OpenSessionAsync(string path, bool show, TimeSpan timeout)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            throw new ArgumentException("path is required for 'open' action", nameof(path));
+        }
+
+        // Validate Windows path format before any file operations
+        var pathError = ExcelToolsBase.ValidateWindowsPath(path);
+        if (pathError != null)
+        {
+            return pathError;
+        }
+
+        if (!File.Exists(path))
+        {
+            return JsonSerializer.Serialize(new
+            {
+                success = false,
+                errorMessage = $"File not found: {path}",
+                errorCategory = "NotFound",
+                filePath = path,
+                isError = true
+            }, ExcelToolsBase.JsonOptions);
+        }
+
+        var timeoutSeconds = (int)timeout.TotalSeconds;
+        var response = ServiceBridge.ServiceBridge.SendAsync(
+            "session.open",
+            null,
+            new { filePath = path, show = show, timeoutSeconds },
+            timeoutSeconds
+        ).GetAwaiter().GetResult();
+
+        if (!response.Success)
+        {
+            var errorMessage = response.ErrorMessage ?? "Failed to open session";
+            return JsonSerializer.Serialize(new
+            {
+                success = false,
+                error = errorMessage,
+                errorMessage,
+                errorCategory = response.ErrorCategory,
+                exceptionType = response.ExceptionType,
+                hresult = response.HResult,
+                innerError = response.InnerError,
+                filePath = path,
+                isError = true
+            }, ExcelToolsBase.JsonOptions);
+        }
+
+        // Parse service response and transform sessionId → session_id for MCP snake_case compatibility
+        if (!string.IsNullOrEmpty(response.Result))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(response.Result);
+                if (doc.RootElement.TryGetProperty("sessionId", out var sessionIdProp))
+                {
+                    var sessionId = sessionIdProp.GetString();
+                    string? filePath = doc.RootElement.TryGetProperty("filePath", out var fp) ? fp.GetString() : path;
+                    return JsonSerializer.Serialize(new
+                    {
+                        success = true,
+                        session_id = sessionId,
+                        filePath
+                    }, ExcelToolsBase.JsonOptions);
+                }
+            }
+            catch (JsonException)
+            {
+                // Fall through to return raw result
+            }
+
+            return response.Result;
+        }
+
+        // Fallback: response should have contained sessionId
+        return JsonSerializer.Serialize(new
+        {
+            success = true,
+            filePath = path,
+            show
+        }, ExcelToolsBase.JsonOptions);
+    }
+
+    /// <summary>
+    /// Closes an active session via the ExcelMCP Service with optional atomic save.
+    /// The default save=false discards changes; set save=true to persist before closing.
+    /// </summary>
+    private static string CloseSessionAsync(string sessionId, bool save)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId))
+        {
+            throw new ArgumentException(SessionIdentityFilter.ErrorMessage);
+        }
+
+        var response = ServiceBridge.ServiceBridge.SendAsync(
+            "session.close",
+            sessionId,
+            new { save }
+        ).GetAwaiter().GetResult();
+
+        if (!response.Success)
+        {
+            var errorMessage = response.ErrorMessage ?? "Failed to close session";
+            return JsonSerializer.Serialize(new
+            {
+                success = false,
+                session_id = sessionId,
+                error = errorMessage,
+                errorMessage,
+                errorCategory = response.ErrorCategory,
+                exceptionType = response.ExceptionType,
+                hresult = response.HResult,
+                innerError = response.InnerError,
+                isError = true
+            }, ExcelToolsBase.JsonOptions);
+        }
+
+        return response.Result ?? JsonSerializer.Serialize(new
+        {
+            success = true,
+            session_id = sessionId,
+            saved = save
+        }, ExcelToolsBase.JsonOptions);
+    }
+
+    /// <summary>
+    /// Creates a new empty Excel file AND opens a session in one operation.
+    /// Returns sessionId that must be used for all subsequent operations.
+    /// Directory must exist - will not be created automatically.
+    /// </summary>
+    private static string CreateSessionAsync(string path, bool show, TimeSpan timeout)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            throw new ArgumentException("path is required for 'create' action", nameof(path));
+        }
+
+        // Validate Windows path format before any file operations
+        var pathError = ExcelToolsBase.ValidateWindowsPath(path);
+        if (pathError != null)
+        {
+            return pathError;
+        }
+
+        // Determine if macro-enabled from extension
+        bool macroEnabled = path.EndsWith(".xlsm", StringComparison.OrdinalIgnoreCase);
+
+        var timeoutSeconds = (int)timeout.TotalSeconds;
+        var response = ServiceBridge.ServiceBridge.SendAsync(
+            "session.create",
+            null,
+            new { filePath = path, macroEnabled, show = show, timeoutSeconds },
+            timeoutSeconds
+        ).GetAwaiter().GetResult();
+
+        if (!response.Success)
+        {
+            var errorMessage = response.ErrorMessage ?? "Failed to create session";
+            return JsonSerializer.Serialize(new
+            {
+                success = false,
+                error = errorMessage,
+                errorMessage,
+                errorCategory = response.ErrorCategory,
+                exceptionType = response.ExceptionType,
+                hresult = response.HResult,
+                innerError = response.InnerError,
+                filePath = path,
+                isError = true
+            }, ExcelToolsBase.JsonOptions);
+        }
+
+        // Parse service response and transform sessionId → session_id for MCP snake_case compatibility
+        if (!string.IsNullOrEmpty(response.Result))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(response.Result);
+                if (doc.RootElement.TryGetProperty("sessionId", out var sessionIdProp))
+                {
+                    var sessionId = sessionIdProp.GetString();
+                    string? filePath = doc.RootElement.TryGetProperty("filePath", out var fp) ? fp.GetString() : path;
+                    return JsonSerializer.Serialize(new
+                    {
+                        success = true,
+                        session_id = sessionId,
+                        filePath
+                    }, ExcelToolsBase.JsonOptions);
+                }
+            }
+            catch (JsonException)
+            {
+                // Fall through to return raw result
+            }
+
+            return response.Result;
+        }
+
+        // Fallback: response should have contained session_id
+        return JsonSerializer.Serialize(new
+        {
+            success = true,
+            filePath = path,
+            macroEnabled,
+            show
+        }, ExcelToolsBase.JsonOptions);
+    }
+
+    /// <summary>
+    /// Lists all active sessions with status info. Lightweight operation - no Excel COM calls.
+    /// LLM Pattern: Use this to verify sessions and check for running operations before closing.
+    /// </summary>
+    private static string ListSessions()
+    {
+        var response = ServiceBridge.ServiceBridge.SendAsync("session.list").GetAwaiter().GetResult();
+
+        if (!response.Success)
+        {
+            var errorMessage = response.ErrorMessage ?? "Failed to list sessions";
+            return JsonSerializer.Serialize(new
+            {
+                success = false,
+                error = errorMessage,
+                errorMessage,
+                errorCategory = response.ErrorCategory,
+                exceptionType = response.ExceptionType,
+                hresult = response.HResult,
+                innerError = response.InnerError,
+                isError = true
+            }, ExcelToolsBase.JsonOptions);
+        }
+
+        return response.Result ?? JsonSerializer.Serialize(new
+        {
+            success = true,
+            sessions = Array.Empty<object>(),
+            count = 0
+        }, ExcelToolsBase.JsonOptions);
+    }
+
+    /// <summary>
+    /// Tests file existence, validity, openability, and IRM/AIP read-only requirements
+    /// without opening it via Excel COM.
+    /// LLM Pattern: Use this for discovery/connectivity testing before running operations.
+    /// </summary>
+    private static string TestFileAsync(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            throw new ArgumentException("path is required for 'test' action", nameof(path));
+        }
+
+        var response = ServiceBridge.ServiceBridge.TestFileAsync(path).GetAwaiter().GetResult();
+        if (!response.Success)
+        {
+            var errorMessage = response.ErrorMessage ?? "Failed to test file";
+            return JsonSerializer.Serialize(new
+            {
+                success = false,
+                error = errorMessage,
+                errorMessage,
+                errorCategory = response.ErrorCategory,
+                exceptionType = response.ExceptionType,
+                hresult = response.HResult,
+                innerError = response.InnerError,
+                filePath = path,
+                isError = true
+            }, ExcelToolsBase.JsonOptions);
+        }
+
+        return response.Result ?? throw new InvalidOperationException(
+            "File test succeeded without returning validation metadata.");
+    }
+}

@@ -1,0 +1,7 @@
+{
+  "servers": {
+    "excel-mcp": {
+      "command": "mcp-excel"
+    }
+  }
+}

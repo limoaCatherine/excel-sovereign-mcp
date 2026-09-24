@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "excel-mcp": {
+      "command": "mcp-excel",
+      "args": [],
+      "env": {}
+    }
+  }
+}

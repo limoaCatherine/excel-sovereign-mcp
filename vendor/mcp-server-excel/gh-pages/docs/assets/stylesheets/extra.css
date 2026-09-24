@@ -1,0 +1,335 @@
+/* ---------------------------------------------------------------------------
+   Excel MCP Server — custom styling on top of the Material theme.
+   Only the marketing homepage hero needs bespoke rules; everything else uses
+   Material's built-in components (grid cards, admonitions, tables, nav).
+   --------------------------------------------------------------------------- */
+
+:root {
+  /* Excel brand green — matches the product/logo and the pre-MkDocs site */
+  --md-primary-fg-color: #217346;
+  --md-primary-fg-color--light: #2a8c56;
+  --md-primary-fg-color--dark: #185c37;
+  --md-accent-fg-color: #107c41;
+
+  --mcp-hero-bg-1: #217346; /* Excel green */
+  --mcp-hero-bg-2: #1d7a4c; /* Keeps white text above WCAG AA contrast */
+}
+
+/* Dark mode: lift the greens slightly for contrast on the slate background */
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #2a8c56;
+  --md-primary-fg-color--light: #33a85c;
+  --md-primary-fg-color--dark: #217346;
+  --md-accent-fg-color: #33a85c;
+}
+
+/* Marketing hero on the landing page */
+.mcp-hero {
+  text-align: center;
+  padding: 1.1rem 1rem 1rem;
+  margin: -1.2rem 0 1.4rem;
+  border-radius: 0.6rem;
+  color: #ffffff;
+  background: linear-gradient(135deg, var(--mcp-hero-bg-1), var(--mcp-hero-bg-2));
+}
+
+.md-typeset .mcp-hero__title {
+  margin: 0.1rem 0 0.3rem;
+  font-size: 1.9rem;
+  font-weight: 700;
+  line-height: 1.1;
+  color: #ffffff;
+}
+
+.mcp-hero__subtitle {
+  max-width: 40rem;
+  margin: 0 auto 0.85rem;
+  font-size: 0.95rem;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.94);
+}
+
+.mcp-hero__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  justify-content: center;
+  margin-bottom: 0.85rem;
+}
+
+/* Reuse Material buttons but adapt colors for the dark hero */
+.mcp-hero__actions .md-button {
+  color: #ffffff;
+  border-color: rgba(255, 255, 255, 0.7);
+}
+
+.mcp-hero__actions .md-button:hover {
+  background-color: #ffffff;
+  color: var(--mcp-hero-bg-1);
+  border-color: #ffffff;
+}
+
+.mcp-hero__actions .md-button--primary {
+  background-color: #ffffff;
+  color: #185c37;
+  border-color: #ffffff;
+}
+
+.mcp-hero__actions .md-button--primary:hover {
+  background-color: rgba(255, 255, 255, 0.85);
+  color: #185c37;
+}
+
+.mcp-hero__badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  justify-content: center;
+  margin: 0;
+}
+
+.mcp-hero__badges img {
+  height: 20px;
+}
+
+/* Centered intro video block */
+.mcp-video {
+  text-align: center;
+  margin: 2rem 0;
+}
+
+.mcp-video img {
+  border-radius: 0.5rem;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+/* Contextual links remain identifiable without relying on color alone. */
+.md-typeset p a:not(.md-button),
+.md-typeset li a:not(.md-button),
+.md-typeset td a {
+  text-decoration: underline;
+  text-underline-offset: 0.12em;
+}
+
+/* Grid cards: give the leading icon the accent color and tighten spacing */
+.md-typeset .grid.cards .twemoji,
+.md-typeset .grid.cards svg {
+  fill: var(--md-accent-fg-color);
+}
+
+.md-typeset .grid.cards > ul > li {
+  padding: 0.8rem 0.9rem;
+}
+
+.md-typeset .grid {
+  gap: 0.6rem;
+}
+
+.md-typeset .feature-groups > ul > li {
+  display: flex;
+  flex-direction: column;
+}
+
+.md-typeset .feature-groups > ul > li > p:last-child {
+  margin-top: auto;
+}
+
+@media screen and (max-width: 44.9375em) {
+  .md-typeset .mcp-hero__title {
+    font-size: 1.6rem;
+  }
+}
+
+/* Public analytics: simple, accessible comparisons without a chart library. */
+.analytics-cards strong {
+  font-size: 1.05rem;
+}
+
+.analytics-bars {
+  margin: 1rem 0 1.4rem;
+}
+
+.analytics-bars__row {
+  margin: 0.65rem 0;
+}
+
+.analytics-bars__label {
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+  font-size: 0.78rem;
+}
+
+.analytics-bars__track {
+  height: 0.55rem;
+  overflow: hidden;
+  margin-top: 0.18rem;
+  border-radius: 1rem;
+  background: color-mix(in srgb, var(--md-default-fg-color) 12%, transparent);
+}
+
+.analytics-bars__track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--md-primary-fg-color);
+}
+
+.analytics-week-chart {
+  margin: 1.2rem 0 1.6rem;
+}
+
+.analytics-week-chart__body {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.analytics-week-chart__y-axis {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  justify-content: space-between;
+  min-width: 2.8rem;
+  height: 10rem;
+  padding: 0.1rem 0 1rem;
+  color: var(--md-default-fg-color--light);
+  font-size: 0.58rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  text-align: right;
+}
+
+.analytics-week-chart__plot {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: end;
+  gap: 0.35rem;
+  height: 10rem;
+  padding-top: 0.8rem;
+  background: linear-gradient(
+    to bottom,
+    transparent 49.5%,
+    color-mix(in srgb, var(--md-default-fg-color) 12%, transparent) 50%,
+    transparent 50.5%
+  );
+  border-bottom: 1px solid color-mix(in srgb, var(--md-default-fg-color) 25%, transparent);
+}
+
+.analytics-week-chart__week {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  justify-content: end;
+  min-width: 0;
+  height: 100%;
+  text-align: center;
+}
+
+.analytics-week-chart__week span {
+  display: block;
+  min-height: 0.2rem;
+  border-radius: 0.2rem 0.2rem 0 0;
+  background: var(--md-primary-fg-color);
+}
+
+.analytics-week-chart__week small {
+  overflow: hidden;
+  margin-top: 0.25rem;
+  font-size: 0.58rem;
+  line-height: 1;
+  text-overflow: clip;
+  white-space: nowrap;
+}
+
+.analytics-version-chart {
+  margin: 1.2rem 0 1.6rem;
+}
+
+.analytics-version-chart__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.8rem;
+  margin-bottom: 0.6rem;
+  font-size: 0.65rem;
+}
+
+.analytics-version-chart__legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.analytics-version-chart__legend i {
+  width: 0.65rem;
+  height: 0.65rem;
+  border-radius: 0.15rem;
+}
+
+.analytics-version-chart__body {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.analytics-version-chart__y-axis {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  justify-content: space-between;
+  min-width: 2.8rem;
+  height: 10rem;
+  padding: 0.1rem 0 1rem;
+  color: var(--md-default-fg-color--light);
+  font-size: 0.58rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  text-align: right;
+}
+
+.analytics-version-chart__plot {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: end;
+  gap: 0.35rem;
+  height: 10rem;
+  background: linear-gradient(
+    to bottom,
+    transparent 49.5%,
+    color-mix(in srgb, var(--md-default-fg-color) 18%, transparent) 50%,
+    transparent 50.5%
+  );
+  border-bottom: 1px solid color-mix(in srgb, var(--md-default-fg-color) 25%, transparent);
+}
+
+.analytics-version-chart__week {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  justify-content: end;
+  min-width: 0;
+  height: 100%;
+  text-align: center;
+}
+
+.analytics-version-chart__stack {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column-reverse;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 0.2rem 0.2rem 0 0;
+}
+
+.analytics-version-chart__stack span {
+  display: block;
+  flex: 0 0 auto;
+  min-height: 1px;
+}
+
+.analytics-version-chart__week small {
+  overflow: hidden;
+  margin-top: 0.25rem;
+  font-size: 0.58rem;
+  line-height: 1;
+  text-overflow: clip;
+  white-space: nowrap;
+}

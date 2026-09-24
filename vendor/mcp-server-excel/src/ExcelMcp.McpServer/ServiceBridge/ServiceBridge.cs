@@ -1,0 +1,340 @@
+using System.Text.Json;
+using Sbroenne.ExcelMcp.Service;
+
+namespace Sbroenne.ExcelMcp.McpServer.ServiceBridge;
+
+internal interface IServiceBridgeBackend : IDisposable
+{
+    Task<ServiceResponse> ProcessAsync(ServiceRequest request);
+    bool ForceCloseSession(string sessionId);
+}
+
+internal sealed class ExcelMcpServiceBackend(Service.ExcelMcpService service) : IServiceBridgeBackend
+{
+    public Task<ServiceResponse> ProcessAsync(ServiceRequest request) => service.ProcessAsync(request);
+
+    public bool ForceCloseSession(string sessionId) => service.SessionManager.CloseSession(sessionId, save: false, force: true);
+
+    public void Dispose() => service.Dispose();
+}
+
+/// <summary>
+/// Bridge that holds the in-process ExcelMCP Service for direct method calls.
+/// No named pipe — MCP tools call the service directly (same process).
+/// </summary>
+public static class ServiceBridge
+{
+    private static readonly SemaphoreSlim _initLock = new(1, 1);
+    private static readonly Func<IServiceBridgeBackend> DefaultServiceFactory =
+        static () => new ExcelMcpServiceBackend(new Service.ExcelMcpService());
+
+    private static IServiceBridgeBackend? _service;
+    private static Func<IServiceBridgeBackend> _serviceFactory = DefaultServiceFactory;
+    private static Exception? _lastStartupException;
+    private static long _pendingTestOwnerToken;
+    private static long _serviceOwnerToken;
+
+    /// <summary>
+    /// JSON serializer options for deserializing service responses.
+    /// </summary>
+    public static readonly JsonSerializerOptions JsonOptions = ServiceProtocol.JsonOptions;
+
+    /// <summary>
+    /// Ensures the in-process ExcelMCP Service is created.
+    /// Called automatically on first request.
+    /// </summary>
+    public static async Task<bool> EnsureServiceAsync(CancellationToken cancellationToken = default)
+    {
+        if (_service != null)
+        {
+            return true;
+        }
+
+        await _initLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (_service != null)
+            {
+                return true;
+            }
+
+            _service = _serviceFactory();
+            _serviceOwnerToken = Interlocked.Read(ref _pendingTestOwnerToken);
+            _lastStartupException = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _lastStartupException = ex;
+            return false;
+        }
+        finally
+        {
+            _initLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Sends a command to the ExcelMCP Service directly (in-process, no pipe).
+    /// </summary>
+    public static async Task<ServiceResponse> SendAsync(
+        string command,
+        string? sessionId = null,
+        object? args = null,
+        int? timeoutSeconds = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (!await EnsureServiceAsync(cancellationToken))
+        {
+            return new ServiceResponse
+            {
+                Success = false,
+                Command = command,
+                SessionId = sessionId,
+                ErrorCategory = "ServiceStartup",
+                ErrorMessage = BuildServiceStartupErrorMessage(_lastStartupException),
+                ExceptionType = _lastStartupException?.GetType().Name
+            };
+        }
+
+        var request = new ServiceRequest
+        {
+            Command = command,
+            SessionId = sessionId,
+            Args = args != null ? JsonSerializer.Serialize(args, JsonOptions) : null
+        };
+
+        var service = _service!;
+        var processTask = Task.Run(async () => await service.ProcessAsync(request), CancellationToken.None);
+
+        if (!timeoutSeconds.HasValue && !cancellationToken.CanBeCanceled)
+        {
+            return await processTask;
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (timeoutSeconds.HasValue)
+        {
+            cts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds.Value));
+        }
+
+        try
+        {
+            return await processTask.WaitAsync(cts.Token);
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+            var completedResponse = await TryGetCompletedResponseAsync(processTask);
+            if (completedResponse != null)
+            {
+                return completedResponse;
+            }
+
+            CleanupCancelledRequest(service, sessionId);
+
+            if (timeoutSeconds.HasValue && !cancellationToken.IsCancellationRequested)
+            {
+                return new ServiceResponse
+                {
+                    Success = false,
+                    Command = command,
+                    SessionId = sessionId,
+                    ErrorCategory = "Timeout",
+                    ErrorMessage = $"Operation timed out after {timeoutSeconds} seconds.",
+                    ExceptionType = nameof(TimeoutException)
+                };
+            }
+
+            return new ServiceResponse
+            {
+                Success = false,
+                Command = command,
+                SessionId = sessionId,
+                ErrorCategory = "Cancelled",
+                ErrorMessage = string.IsNullOrWhiteSpace(sessionId)
+                    ? "Operation was cancelled. The Excel MCP service was reset to avoid leaving a stuck Excel operation behind."
+                    : "Operation was cancelled and the session has been closed to avoid leaving a stuck Excel operation behind. Please reopen the file with a new session.",
+                ExceptionType = nameof(OperationCanceledException)
+            };
+        }
+    }
+
+    private static void CleanupCancelledRequest(IServiceBridgeBackend service, string? sessionId)
+    {
+        if (!string.IsNullOrWhiteSpace(sessionId))
+        {
+            try
+            {
+                if (service.ForceCloseSession(sessionId))
+                {
+                    return;
+                }
+            }
+            catch (Exception)
+            {
+                // Fall back to resetting the entire service below.
+            }
+        }
+
+        Dispose();
+    }
+
+    private static async Task<ServiceResponse?> TryGetCompletedResponseAsync(Task<ServiceResponse> processTask)
+    {
+        if (processTask.IsCompleted)
+        {
+            return await processTask;
+        }
+
+        var completedTask = await Task.WhenAny(
+            processTask,
+            Task.Delay(TimeSpan.FromMilliseconds(50))).ConfigureAwait(false);
+
+        if (completedTask == processTask)
+        {
+            return await processTask.ConfigureAwait(false);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Sends a session-scoped command to the service.
+    /// </summary>
+    public static async Task<ServiceResponse> WithSessionAsync(
+        string sessionId,
+        string command,
+        object? args = null,
+        int? timeoutSeconds = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId))
+        {
+            return new ServiceResponse
+            {
+                Success = false,
+                Command = command,
+                ErrorCategory = "InvalidInput",
+                ErrorMessage = "sessionId is required. Use file 'open' action to start a session."
+            };
+        }
+
+        return await SendAsync(command, sessionId, args, timeoutSeconds, cancellationToken);
+    }
+
+    /// <summary>
+    /// Opens a session via the service.
+    /// </summary>
+    public static async Task<ServiceResponse> OpenSessionAsync(
+        string excelPath,
+        bool show = false,
+        int? timeoutSeconds = null,
+        CancellationToken cancellationToken = default)
+    {
+        return await SendAsync("session.open", null, new
+        {
+            filePath = excelPath,
+            show,
+            timeoutSeconds
+        }, timeoutSeconds, cancellationToken);
+    }
+
+    /// <summary>
+    /// Creates a new file and opens a session via the service.
+    /// </summary>
+    public static async Task<ServiceResponse> CreateSessionAsync(
+        string excelPath,
+        bool? macroEnabled = null,
+        bool show = false,
+        int? timeoutSeconds = null,
+        CancellationToken cancellationToken = default)
+    {
+        return await SendAsync("session.create", null, new
+        {
+            filePath = excelPath,
+            macroEnabled,
+            show,
+            timeoutSeconds
+        }, timeoutSeconds, cancellationToken);
+    }
+
+    /// <summary>
+    /// Closes a session via the service.
+    /// </summary>
+    public static async Task<ServiceResponse> CloseSessionAsync(
+        string sessionId,
+        bool save = false,
+        CancellationToken cancellationToken = default)
+    {
+        return await SendAsync("session.close", sessionId, new { save }, cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Lists active sessions via the service.
+    /// </summary>
+    public static async Task<ServiceResponse> ListSessionsAsync(CancellationToken cancellationToken = default)
+    {
+        return await SendAsync("session.list", cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Tests if a file can be opened via the service.
+    /// </summary>
+    public static async Task<ServiceResponse> TestFileAsync(
+        string excelPath,
+        CancellationToken cancellationToken = default)
+    {
+        return await SendAsync("session.test", null, new { filePath = excelPath }, cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Disposes the in-process ExcelMCP Service, auto-saving all sessions before shutdown.
+    /// Must be called when the MCP server process exits to prevent silent data loss.
+    /// </summary>
+    public static void Dispose()
+    {
+        var service = Interlocked.Exchange(ref _service, null);
+        Interlocked.Exchange(ref _serviceOwnerToken, 0);
+        service?.Dispose();
+        _lastStartupException = null;
+    }
+
+    internal static void SetTestOwnerToken(long ownerToken)
+    {
+        Interlocked.Exchange(ref _pendingTestOwnerToken, ownerToken);
+    }
+
+    internal static bool DisposeIfOwnedBy(long ownerToken)
+    {
+        if (ownerToken == 0 || Interlocked.Read(ref _serviceOwnerToken) != ownerToken)
+        {
+            return false;
+        }
+
+        Dispose();
+        return true;
+    }
+
+    internal static void SetServiceFactoryForTests(Func<IServiceBridgeBackend> serviceFactory)
+    {
+        Dispose();
+        _serviceFactory = serviceFactory;
+    }
+
+    internal static void ResetForTests()
+    {
+        Dispose();
+        Interlocked.Exchange(ref _pendingTestOwnerToken, 0);
+        _serviceFactory = DefaultServiceFactory;
+    }
+
+    private static string BuildServiceStartupErrorMessage(Exception? exception)
+    {
+        if (exception == null)
+        {
+            return "Failed to start ExcelMCP Service in-process.";
+        }
+
+        return $"Failed to start ExcelMCP Service in-process: {exception.GetType().Name}: {exception.Message}";
+    }
+}
