@@ -12,7 +12,7 @@ from openpyxl import Workbook
 from excel_sovereign.book import apply_ops, file_hash, load_for_edit, save_atomic
 from excel_sovereign.inspect import inspect_workbook
 from excel_sovereign.lock import FileLock, canonical_path
-from excel_sovereign.route import com_args, count_cells, decide, normalize_ops
+from excel_sovereign.route import KNOWN_ACTIONS, TOOL_ACTIONS, action_outside, com_args, count_cells, decide, normalize_ops
 from excel_sovereign.server import _response, apply_workbook
 from excel_sovereign.verify import VerifyOutcome
 
@@ -206,6 +206,36 @@ def test_cell_counter_matches_values():
 
 def test_canonical_path_folds_case():
     assert canonical_path("C:/Temp/A.xlsx") == canonical_path("c:/temp/a.xlsx")
+
+
+def test_actions_belong_to_one_tool():
+    owners = {}
+    for tool, actions in TOOL_ACTIONS.items():
+        assert "verify" in actions
+        for action in actions:
+            if action == "verify":
+                continue
+            assert action not in owners, action
+            owners[action] = tool
+    assert KNOWN_ACTIONS | {"layout"} <= set(owners) | {"verify"}
+
+
+def test_other_family_is_rejected_before_write(tmp_path: Path):
+    path = tmp_path / "a.xlsx"
+    _xlsx(path)
+    before = file_hash(str(path))
+    body, _ = apply_workbook(
+        str(path),
+        [{"action": "pivot_create_from_range", "sheet": "参数", "range": "A1:B2"}],
+        "workbook_apply",
+    )
+    assert body["error"]["code"] == "wrong_tool"
+    assert body["committed"] is False
+    assert body["suggestedNextActions"] == [
+        {"tool": "excel_table", "ops": [{"action": "pivot_create_from_range"}]}
+    ]
+    assert file_hash(str(path)) == before
+    assert action_outside("excel_vba", [{"action": "vba_run", "macro": "Module1.Main"}]) is None
 
 
 def test_com_write_range_matches_matrix():

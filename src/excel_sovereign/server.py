@@ -27,6 +27,7 @@ from excel_sovereign.route import (
     com_args,
     count_cells,
     decide,
+    action_outside,
     normalize_ops,
     shift_address,
     validate_known,
@@ -306,7 +307,20 @@ def _run_verify(
 
 def apply_workbook(path: str, ops: list[dict], tool: str = "workbook_apply") -> tuple[dict, list]:
     try:
-        ops = expand_layouts(normalize_ops(ops))
+        ops = normalize_ops(ops)
+    except ValueError as exc:
+        return _error("invalid_ops", str(exc), path=path), []
+    foreign = action_outside(tool, ops)
+    if foreign:
+        action, owner = foreign
+        return _error(
+            "wrong_tool",
+            f"{action} belongs to {owner}",
+            path=path,
+            suggestedNextActions=[{"tool": owner, "ops": [{"action": action}]}],
+        ), []
+    try:
+        ops = expand_layouts(ops)
     except ValueError as exc:
         return _error("invalid_ops", str(exc), path=path), []
     unknown = validate_known(ops)
@@ -754,34 +768,73 @@ def workbook_read(
     return [page]
 
 
+def _apply(path: str, ops: list[dict[str, Any]], tool: str) -> list:
+    body, shots = apply_workbook(path, ops, tool)
+    return _with_images(body, shots)
+
+
 @mcp.tool(structured_output=False)
 def workbook_apply(path: str, ops: list[dict[str, Any]]) -> list:
-    """Apply a batch of ops, save once, recalculate when required, then screenshot.
+    """Write values, formulas, names, formatting, sheet structure, and layout. Saves once and screenshots.
 
-    Do not pass engine or session_id. Structural ops, VBA, tables, pivots, charts,
-    Power Query, and data-model ops are routed to Excel automatically.
-    Put every change to this file in one ops list. After committed is true, do not
-    send the same structural ops again. If verified is false, call verify only.
-    Formulas use English function names. Number formats use Excel format codes.
-    Close the file in Excel before calling. Screenshot is included; do not ask for
-    another image. Do not paint Excel table bodies with format.
-    For a new sheet, send action layout. Profiles share one palette; blocks differ by domain.
+    Actions: set_values, set_formulas, clear_contents, clear_all, format, merge, unmerge,
+    set_row_height, set_column_width, define_name, define_name_update, create_workbook,
+    create_sheet, rename_sheet, copy_sheet, move_sheet, delete_sheet, insert_rows, delete_rows,
+    insert_columns, delete_columns, insert_cells, delete_cells, layout, verify.
+    One file per call. Tables, pivots, charts, queries, the data model, and VBA have their own tools.
+    English formulas. Excel number formats. Close the file in Excel first. Do not repeat a committed insert.
+    layout starts a sheet. profile is finance, analytics, or general. A fact block becomes an Excel table.
     """
-    body, shots = apply_workbook(path, ops, "workbook_apply")
-    return _with_images(body, shots)
+    return _apply(path, ops, "workbook_apply")
 
 
 @mcp.tool(structured_output=False)
-def excel_exec(path: str, ops: list[dict[str, Any]]) -> list:
-    """Same ops as workbook_apply, including VBA, tables, pivots, charts, Power Query, and DAX.
+def excel_table(path: str, ops: list[dict[str, Any]]) -> list:
+    """Excel tables, pivot tables, charts, and slicers. Saves once and screenshots.
 
-    The server still chooses the engine. VBA runs only when an op in this call
-    imports, updates, or runs VBA, and Excel must trust access to the VBA project.
-    Screenshot is part of this call. A failed verify is retried with action verify,
-    never by repeating an insert or delete.
+    Actions: table_list, table_read, table_create, table_append, table_resize, table_rename,
+    table_delete, table_set_style, table_apply_filter, table_clear_filters, pivot_list,
+    pivot_create_from_range, pivot_create_from_table, pivot_refresh, pivot_delete, chart_list,
+    chart_create_from_range, chart_create_from_table, chart_move, chart_fit, chart_delete,
+    slicer_list, slicer_create, slicer_delete, verify.
+    Put command fields on the op. Do not paint a table body with format.
     """
-    body, shots = apply_workbook(path, ops, "excel_exec")
-    return _with_images(body, shots)
+    return _apply(path, ops, "excel_table")
+
+
+@mcp.tool(structured_output=False)
+def excel_model(path: str, ops: list[dict[str, Any]]) -> list:
+    """Power Query and the data model. Saves once and screenshots.
+
+    Actions: powerquery_list, powerquery_view, powerquery_create, powerquery_update,
+    powerquery_refresh, powerquery_refresh_all, powerquery_delete, powerquery_rename,
+    datamodel_list_tables, datamodel_list_measures, datamodel_create_measure,
+    datamodel_update_measure, datamodel_delete_measure, datamodel_evaluate, datamodel_refresh,
+    table_add_to_data_model, table_create_from_dax, verify.
+    """
+    return _apply(path, ops, "excel_model")
+
+
+@mcp.tool(structured_output=False)
+def excel_view(path: str, ops: list[dict[str, Any]]) -> list:
+    """Conditional formats, validation, comments, hyperlinks, freeze panes, and sheet visibility.
+
+    Actions: conditional_format_add, conditional_format_clear, conditional_format_list,
+    validation_add, validation_get, validation_remove, comment_set, comment_get, comment_clear,
+    threaded_comment_add, hyperlink_add, hyperlink_remove, freeze, unfreeze, sheet_hide,
+    sheet_show, verify.
+    """
+    return _apply(path, ops, "excel_view")
+
+
+@mcp.tool(structured_output=False)
+def excel_vba(path: str, ops: list[dict[str, Any]]) -> list:
+    """List, view, import, update, run, or delete VBA. Macros are enabled only on this tool.
+
+    Actions: vba_list, vba_view, vba_import, vba_update, vba_run, vba_delete, verify.
+    Excel must trust access to the VBA project object model.
+    """
+    return _apply(path, ops, "excel_vba")
 
 
 def main() -> None:

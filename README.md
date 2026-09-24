@@ -33,16 +33,22 @@ Cursor 里这样注册：
 
 ## 架构
 
-三个工具，一条写入管道。模型不传 `engine`，也不持有 `session_id`。
+六个入口，一条写入管道。模型不传 `engine`，也不持有 `session_id`。入口只决定这批 `ops` 属于哪一组动作，不决定用文件包还是 Excel。
 
 ```mermaid
 flowchart TD
   model[模型] --> read[workbook_read]
   model --> apply[workbook_apply]
-  model --> exec[excel_exec]
+  model --> table[excel_table]
+  model --> modeltool[excel_model]
+  model --> view[excel_view]
+  model --> vba[excel_vba]
   read --> lock[按绝对路径加锁]
   apply --> lock
-  exec --> lock
+  table --> lock
+  modeltool --> lock
+  view --> lock
+  vba --> lock
   lock --> inspect[检查 zip 部件和 ops]
   inspect --> route{整批路由}
   route -->|纯包| ox[openpyxl 在内存里改]
@@ -53,7 +59,7 @@ flowchart TD
   shot --> back[返回 committed、verified 和图片]
 ```
 
-`workbook_apply` 和 `excel_exec` 使用同一份 `ops`。名字不决定引擎。一批里只要有一步需要 Excel，整批都走 COM。
+各入口使用同一份 `ops` 形状。一批里只要有一步需要 Excel，整批都走 COM。表、查询、数据模型和 VBA 分开发送，避免每次对话带上全部参数。
 
 ```mermaid
 sequenceDiagram
@@ -76,13 +82,18 @@ sequenceDiagram
 
 `verify` 是一个操作，不是第四个工具。它只重新打开、重算和截图，不会把插入或删除再做一遍。
 
-## 三个工具
+## 六个入口
 
 | 工具 | 作用 |
 |---|---|
 | `workbook_read` | 读值、公式和缓存。默认 4000 格，用 `nextRange` 继续。拿同一把锁，不截图。 |
-| `workbook_apply` | 写入、排版、`layout`、结构修改。服务端保存并截图。 |
-| `excel_exec` | 同一份 `ops`，另外覆盖 VBA、表、透视、图表、Power Query 和 DAX。 |
+| `workbook_apply` | 值、公式、名称、排版、`layout`、工作表结构。服务端保存并截图。 |
+| `excel_table` | 表、透视表、图表、切片器。 |
+| `excel_model` | Power Query、数据模型、DAX。 |
+| `excel_view` | 条件格式、数据验证、批注、超链接、冻结、隐藏工作表。 |
+| `excel_vba` | 列出、查看、导入、更新、运行、删除 VBA。只有这一次调用放开宏。 |
+
+动作名写在对应工具的说明里。每个 op 只带自己用到的字段，不把全部命令参数放进工具 schema。送错入口会返回 `wrong_tool`。
 
 单次写入超过 10 万格返回 `too_large`，不截断保存。只接受 `.xlsx` 和 `.xlsm`。`.xls`、`.xlsb`、加密和 IRM 在改动前拒绝。
 
@@ -94,7 +105,7 @@ sequenceDiagram
 |---|---|---|---|---|---|
 | 运行方式 | 本机 stdio | 本机，也可 HTTP | 本机 Windows | 本机 | 本机 |
 | Excel 程序 | 重算、结构和截图需要 | 不需要 | 每次都需要 | 实时编辑和截图需要 | 不需要 |
-| 工具面 | 3 个工具，一套 `ops` | 按操作拆开 | 31 个工具 | 读、写、截图分开 | 37 个工具 |
+| 工具面 | 6 个入口，一套 `ops` | 按操作拆开 | 31 个工具 | 读、写、截图分开 | 37 个工具 |
 | 谁选引擎 | 服务端 | 文件库 | COM | Windows 上走 Excel | 文件库 |
 | 改表名 | Excel 改名，跨表引用跟着走 | 只改 `sheet.title` | Excel 改名 | 未列为这项能力 | 插入不平移已有公式引用 |
 | 重算 | 工作簿里有公式才 `Calculate` | 读已有缓存 | Excel 计算 | 未列为独立能力 | 明确不重算 |
@@ -142,11 +153,11 @@ COM 调用串行。不同文件的纯包修改可以并行，读也会等到这�
 src/excel_sovereign/     服务、锁、路由、openpyxl、excelcli、截图、做表
 skills/excel-sovereign/  给模型的调用约定
 tests/                   不启动 Excel 的核心测试，以及要 Excel 的验收
-vendor/excel-mcp-server/ Haris 的 openpyxl 来源，浅克隆 f51340e，MIT
-vendor/mcp-server-excel/ sbroenne 的 COM 与截图来源，浅克隆 cea4c31，MIT
+vendor/excel-mcp-server/ Haris 的 openpyxl 来源，保留 src 与 LICENSE
+vendor/mcp-server-excel/ 编译 excelcli 需要的 src、构建脚本和 LICENSE
 ```
 
-两份上游代码保留各自的 `LICENSE`。本仓库的改动是：`excelcli` 只有在这次调用允许宏时才把 `AutomationSecurity` 设为 Low，并增加 `range.get-spill` 用来量动态数组溢出区。构建产物 `bin/` 和 `obj/` 不提交。
+两份上游代码保留各自的 `LICENSE`。视频、大样例、上游测试、站点、扩展和安装包不放进本仓库。本仓库的改动是：`excelcli` 只有在这次调用允许宏时才把 `AutomationSecurity` 设为 Low，并增加 `range.get-spill` 用来量动态数组溢出区。构建产物 `bin/` 和 `obj/` 不提交。
 
 ## 开发
 

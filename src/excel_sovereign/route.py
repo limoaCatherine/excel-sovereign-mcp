@@ -134,6 +134,68 @@ VBA_ACTIONS = {name for name in COM_COMMANDS if name.startswith("vba_")}
 KNOWN_ACTIONS = set(COM_COMMANDS) | {"verify", "create_workbook", "define_name_update"}
 COM_COMMANDS["define_name_update"] = "namedrange.update"
 
+_MODEL_TABLE = {"table_add_to_data_model", "table_create_from_dax"}
+_TABLE_PREFIXES = ("table_", "pivot_", "chart_", "slicer_")
+_MODEL_PREFIXES = ("powerquery_", "datamodel_")
+_VIEW_ACTIONS = {
+    "conditional_format_add",
+    "conditional_format_clear",
+    "conditional_format_list",
+    "validation_add",
+    "validation_get",
+    "validation_remove",
+    "comment_set",
+    "comment_get",
+    "comment_clear",
+    "threaded_comment_add",
+    "hyperlink_add",
+    "hyperlink_remove",
+    "freeze",
+    "unfreeze",
+    "sheet_hide",
+    "sheet_show",
+}
+
+# Tool name selects the action family. It does not select the engine.
+TOOL_ACTIONS: dict[str, set[str]] = {
+    "workbook_apply": STYLE_ACTIONS
+    | VALUE_ACTIONS
+    | FORMULA_ACTIONS
+    | OPENPYXL_SHEET_ACTIONS
+    | STRUCTURE_ACTIONS
+    | {"define_name_update", "layout", "verify"},
+    "excel_table": {
+        name
+        for name in COM_COMMANDS
+        if name.startswith(_TABLE_PREFIXES) and name not in _MODEL_TABLE
+    }
+    | {"verify"},
+    "excel_model": {name for name in COM_COMMANDS if name.startswith(_MODEL_PREFIXES)}
+    | _MODEL_TABLE
+    | {"verify"},
+    "excel_view": set(_VIEW_ACTIONS) | {"verify"},
+    "excel_vba": set(VBA_ACTIONS) | {"verify"},
+}
+
+
+def action_outside(tool: str, ops: list[dict]) -> tuple[str, str] | None:
+    """Return an action that this tool does not own, and the tool that does."""
+    allowed = TOOL_ACTIONS.get(tool)
+    if allowed is None:
+        return None
+    owners = {
+        action: name
+        for name, actions in TOOL_ACTIONS.items()
+        for action in actions
+        if action != "verify"
+    }
+    for op in ops:
+        action = op["action"]
+        if action in allowed or (action not in KNOWN_ACTIONS and action != "layout"):
+            continue
+        return action, owners.get(action, "workbook_apply")
+    return None
+
 # These excelcli actions open files and save outside the session. They are not mapped.
 IMMEDIATE_SAVE_BLOCKED = {"sheet.copy-to-file", "sheet.move-to-file"}
 

@@ -1,6 +1,6 @@
 ---
 name: excel-sovereign-mcp
-description: 用 workbook_read、workbook_apply、excel_exec 修改本地 xlsx 和 xlsm。服务端选择引擎并在同一次调用里截图。
+description: 用六个短入口修改本地 xlsx 和 xlsm。服务端选择引擎，并在同一次调用里保存和截图。
 ---
 
 # excel-sovereign-mcp
@@ -16,8 +16,16 @@ description: 用 workbook_read、workbook_apply、excel_exec 修改本地 xlsx �
 
 ## 工具
 
-- `workbook_read`：值、公式、缓存值。`includeStyles` 的字段和 `format` 相同。默认最多 4000 格，用返回的 `nextRange` 继续读。不截图。
-- `workbook_apply` 和 `excel_exec`：同一份 `ops`。结构修改、表、透视表、图表、Power Query、数据模型、VBA 会整批走 Excel。调用返回前已经截图，不要再单独要图。
+六个入口。参数都是工作簿路径和 `ops`，不要把别的模块的动作塞进同一次调用。同一模块、同一文件合成一次。服务端选择引擎。调用返回前已经截图，不要再单独要图。
+
+- `workbook_read`：值、公式、缓存值。默认最多 4000 格，用 `nextRange` 继续。不截图。
+- `workbook_apply`：值、公式、名称、排版、工作表结构、`layout`。
+- `excel_table`：表、透视表、图表、切片器。
+- `excel_model`：Power Query、数据模型、DAX。
+- `excel_view`：条件格式、数据验证、批注、超链接、冻结、隐藏工作表。
+- `excel_vba`：VBA。只有这次调用才允许宏。Excel 需要信任对 VBA 工程对象模型的访问。
+
+动作名在对应工具的说明里。其余字段直接写在 op 上。送错工具会返回 `wrong_tool`，并给出该用的工具名。
 
 ## 返回
 
@@ -52,21 +60,5 @@ description: 用 workbook_read、workbook_apply、excel_exec 修改本地 xlsx �
 插行：`{"action":"insert_rows","sheet":"Sheet1","row":2,"count":1}`
 
 重命名：`{"action":"rename_sheet","oldName":"Sheet1","newName":"参数"}`
-
-## 阶段 4 动作
-
-这些动作的其余参数放在 `args` 里，名字与 excelcli 一致：
-
-- 表：`table_list` `table_create` `table_append` `table_resize` `table_rename` `table_delete` `table_set_style` `table_apply_filter` `table_clear_filters`
-- 透视表：`pivot_list` `pivot_create_from_range` `pivot_create_from_table` `pivot_refresh` `pivot_delete`
-- 图表：`chart_list` `chart_create_from_range` `chart_create_from_table` `chart_move` `chart_fit` `chart_delete`
-- Power Query：`powerquery_list` `powerquery_create` `powerquery_update` `powerquery_refresh` `powerquery_refresh_all` `powerquery_delete`
-- 数据模型：`table_add_to_data_model` `table_create_from_dax` `datamodel_list_tables` `datamodel_list_measures` `datamodel_create_measure` `datamodel_update_measure` `datamodel_evaluate` `datamodel_refresh`
-- 条件格式：`conditional_format_add` `conditional_format_clear` `conditional_format_list`
-- 数据验证：`validation_add` `validation_remove` `validation_get`
-- 批注：`comment_set` `comment_get` `comment_clear` `threaded_comment_add`
-- 超链接：`hyperlink_add` `hyperlink_remove`
-- 冻结和隐藏：`freeze` `unfreeze` `sheet_hide` `sheet_show`
-- VBA：`vba_list` `vba_view` `vba_import` `vba_update` `vba_run` `vba_delete`。只有这批调用含 VBA 时才允许宏运行。Excel 需要信任对 VBA 工程对象模型的访问。
 
 单次写入超过 10 万格会返回 `too_large`，不会截断保存。
